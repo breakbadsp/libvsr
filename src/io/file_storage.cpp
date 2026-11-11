@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <fcntl.h>
+#include <filesystem>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
@@ -15,6 +16,41 @@ namespace
 [[nodiscard]] std::error_code LastError() noexcept
 {
   return std::error_code{errno, std::generic_category()};
+}
+
+[[nodiscard]] std::expected<void, std::error_code> SyncParentDirectories(const std::string &p_path)
+{
+  std::error_code error;
+  const auto absolute = std::filesystem::absolute(p_path, error);
+  if (error)
+  {
+    return std::unexpected(error);
+  }
+  const auto resolved = std::filesystem::canonical(p_path, error);
+  if (error)
+  {
+    return std::unexpected(error);
+  }
+  // Persist both names when the caller uses a symlink. A new directory
+  // also needs its name persisted in its parent, including on an Open retry.
+  for (auto directory : {absolute.parent_path(), resolved.parent_path()})
+  {
+    while (true)
+    {
+      UniqueFd fd{::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+      if (!fd.IsOpen() || ::fsync(fd.Get()) != 0)
+      {
+        return std::unexpected(LastError());
+      }
+      const auto parent = directory.parent_path();
+      if (parent == directory)
+      {
+        break;
+      }
+      directory = parent;
+    }
+  }
+  return {};
 }
 
 } // namespace
@@ -51,6 +87,10 @@ std::expected<FileStorage::Opened, std::error_code> FileStorage::Open(const std:
   else if (std::cmp_not_equal(status.st_size, p_bytes))
   {
     return std::unexpected(std::make_error_code(std::errc::file_too_large));
+  }
+  if (const auto synced = SyncParentDirectories(p_path); !synced)
+  {
+    return std::unexpected(synced.error());
   }
   return Opened{FileStorage{std::move(fd), p_bytes}, created};
 }
