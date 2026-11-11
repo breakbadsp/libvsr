@@ -1,32 +1,53 @@
 name: CI
-on: [push, pull_request]
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      include_almalinux_9:
+        description: Also test AlmaLinux 9
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    name: AlmaLinux ${{ matrix.version }} / ${{ matrix.check }}
+    # Outside code stays on GitHub runners, away from the owner's computer.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || fromJSON('["self-hosted", "Linux", "X64", "libvsr"]') }}
+    timeout-minutes: 40
     strategy:
+      fail-fast: false
       matrix:
-        compiler: [gcc, clang]
-        mode: [plain, sanitizers]
+        version: ${{ fromJSON(inputs.include_almalinux_9 && '["8", "9"]' || '["8"]') }}
+        check: [gcc, clang, gcc-san, clang-san, fuzz]
     steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y g++-14 clang-18 ninja-build libgtest-dev
-      - name: Configure, build, test, and soak
-        shell: bash
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Build and test in AlmaLinux
+        env:
+          ALMA_VERSION: ${{ matrix.version }}
+          CI_CHECK: ${{ matrix.check }}
         run: |
-          preset=${{ matrix.compiler }}
-          compiler=g++-14
-          if [[ $preset == clang ]]; then compiler=clang++-18; fi
-          if [[ ${{ matrix.mode }} == sanitizers ]]; then preset=$preset-san; fi
-          cmake --preset "$preset" -DCMAKE_CXX_COMPILER="$compiler"
-          cmake --build --preset "$preset"
-          ctest --preset "$preset"
-          ./build/$preset/sim/vsr_sim 1 300 3
-          ./build/$preset/sim/vsr_sim 1 300 5
-  fuzz:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y g++-14 clang-18 ninja-build libgtest-dev
-      - run: cmake --preset clang -DCMAKE_CXX_COMPILER=clang++-18 -DVSR_BUILD_FUZZ=ON
-      - run: cmake --build --preset clang --target vsr_decode_fuzz
-      - run: ./build/clang/fuzz/vsr_decode_fuzz -max_total_time=60
+          mkdir -p reports
+          git rev-parse HEAD > reports/commit.txt
+          image="$(bash .github/scripts/almalinux-image.sh)"
+          docker image inspect "$image" > reports/image.json
+          docker run --rm --cap-drop ALL --security-opt no-new-privileges \
+            -e ALMA_VERSION -e CI_CHECK \
+            -v "$PWD:/source:ro" -v "$PWD/reports:/reports" \
+            "$image" bash /source/.github/scripts/almalinux-build.sh
+      - name: Save build and test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: almalinux-${{ matrix.version }}-${{ matrix.check }}
+          path: reports/
+          retention-days: 14

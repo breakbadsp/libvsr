@@ -87,3 +87,28 @@ one to three entries. The model does not prove the protocol for all sizes.
   They have no fault injection on real networks or disks (Jepsen-style).
 - No test runs more than a few minutes. A long soak (millions of seeds)
   is a task for CI or a dedicated machine.
+
+## AlmaLinux CI
+
+PR checks use a prepared AlmaLinux 8 container on the Omarchy `libvsr`
+runner. Fork PRs use GitHub-hosted runners. Both GCC and Clang run tests
+and 300 simulation seeds for three and five replicas, with and without
+ASan/UBSan. A separate job fuzzes the instrumented decoder for 60 seconds.
+Each job keeps its source mount read-only and builds in a disposable
+container. Build logs, package versions, and CTest logs are CI artifacts.
+
+The manual `CI` workflow can also test AlmaLinux 9. The image helper tags
+prepared images from the Dockerfile and toolchain script content. To
+rebuild a prepared image after a package update, remove that image from
+the runner account before the next run.
+
+Omarchy uses one dedicated libvsr runner slot under `gha-runner`. The
+triangulator slots keep their existing work directories. Register the
+libvsr slot from an authenticated account:
+
+```sh
+gh api -X POST repos/breakbadsp/libvsr/actions/runners/registration-token --jq .token | sudo bash .github/scripts/self-hosted-runner-setup.sh
+```
+
+Jobs use rootless Podman through the runner account's `docker` wrapper.
+Each build uses at most two compiler processes on the shared six-CPU host.
