@@ -13,7 +13,7 @@
 namespace vsr
 {
 
-inline constexpr std::uint16_t kProtocolVersion = 1;
+inline constexpr std::uint16_t kProtocolVersion = 2;
 
 enum class Command : std::uint8_t
 {
@@ -37,11 +37,11 @@ inline constexpr std::uint8_t kCommandCount = 13;
 // Each message starts with this header. A field that a command does not use
 // is zero.
 //
-//   Request          client_, request_; body: the operation. Request number
+//   Request          client_, request_, session_; body: the operation. Request number
 //                    0 registers the client and has no body.
 //   Prepare          commit_, checkpoint_*; body: EntryHeader + operation.
 //   PrepareOk        op_, log_checksum_: the sender holds the log up to op_.
-//   Reply            client_, request_, op_; body: the reply.
+//   Reply            client_, request_, session_, op_; body: the reply.
 //   Commit           op_, log_checksum_: the head of the log of the primary;
 //   StartView        commit_, checkpoint_*. StartView opens a view.
 //   StartViewChange  only view_.
@@ -59,6 +59,8 @@ struct Header
   std::uint64_t cluster_ = 0;
   std::uint64_t client_ = 0;
   std::uint64_t request_ = 0;
+  // The committed registration operation. Zero only for registration.
+  std::uint64_t session_ = 0;
   std::uint64_t op_ = 0;
   std::uint64_t commit_ = 0;
   std::uint64_t log_checksum_ = 0;
@@ -81,7 +83,7 @@ struct Header
   std::uint64_t view_start_op_ = 0;
 };
 
-static_assert(sizeof(Header) == 128, "the wire format is fixed");
+static_assert(sizeof(Header) == 136, "the wire format is fixed");
 static_assert(std::has_unique_object_representations_v<Header>, "no padding in the wire format");
 
 // One log entry. It is immutable after the primary makes it: `parent_` links
@@ -94,6 +96,8 @@ struct EntryHeader
   std::uint64_t cluster_ = 0;
   std::uint64_t client_ = 0;
   std::uint64_t request_ = 0;
+  // The committed registration operation. Zero only for registration.
+  std::uint64_t session_ = 0;
   std::uint64_t op_ = 0;
   std::uint64_t timestamp_ns_ = 0;
   // The view in which the primary made the entry.
@@ -103,7 +107,7 @@ struct EntryHeader
   std::uint8_t reserved_[6] = {};
 };
 
-static_assert(sizeof(EntryHeader) == 80, "the log format is fixed");
+static_assert(sizeof(EntryHeader) == 88, "the log format is fixed");
 static_assert(std::has_unique_object_representations_v<EntryHeader>, "no padding in the log");
 
 inline constexpr std::size_t kHeaderBytes = sizeof(Header);

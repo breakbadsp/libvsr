@@ -296,6 +296,7 @@ void Replica::SendReply(const internal::ClientEntry &p_entry)
   header.client_ = p_entry.client_;
   header.request_ = p_entry.request_;
   header.op_ = p_entry.op_;
+  header.session_ = p_entry.session_;
   const std::size_t message_bytes =
       EncodeMessage(header, clients_.Reply(p_entry), {}, message_buffer_);
   bus_->SendToClient(p_entry.client_, std::span{message_buffer_}.first(message_bytes));
@@ -419,13 +420,13 @@ void Replica::OnMessage(std::span<const std::byte> p_message)
 }
 
 SubmitResult Replica::Submit(std::uint64_t p_client, std::uint64_t p_request,
-                             std::span<const std::byte> p_body)
+                             std::uint64_t p_session, std::span<const std::byte> p_body)
 {
   if (status_ == Status::Halted)
   {
     return SubmitResult::Invalid;
   }
-  return HandleRequest(p_client, p_request, p_body);
+  return HandleRequest(p_client, p_request, p_session, p_body);
 }
 
 void Replica::OnRequest(const Message &p_message)
@@ -433,7 +434,8 @@ void Replica::OnRequest(const Message &p_message)
   const Header &header = p_message.header_;
   if (IsPrimary())
   {
-    static_cast<void>(HandleRequest(header.client_, header.request_, p_message.body_));
+    static_cast<void>(
+        HandleRequest(header.client_, header.request_, header.session_, p_message.body_));
     return;
   }
   // Send the request on once. Two replicas with different views could
@@ -449,7 +451,7 @@ void Replica::OnRequest(const Message &p_message)
 }
 
 SubmitResult Replica::HandleRequest(std::uint64_t p_client, std::uint64_t p_request,
-                                    std::span<const std::byte> p_body)
+                                    std::uint64_t p_session, std::span<const std::byte> p_body)
 {
   if (p_client == 0 || p_body.size() > config_.body_bytes_max_)
   {
@@ -460,11 +462,16 @@ SubmitResult Replica::HandleRequest(std::uint64_t p_client, std::uint64_t p_requ
     return SubmitResult::NotPrimary;
   }
   const bool is_registration = p_request == 0;
-  if (is_registration && !p_body.empty())
+  if (is_registration && (!p_body.empty() || p_session != 0))
   {
     return SubmitResult::Invalid;
   }
   const auto *const session = clients_.Find(p_client);
+  if (!is_registration && session != nullptr && p_session != session->session_)
+  {
+    SendEviction(p_client);
+    return SubmitResult::NoSession;
+  }
   if (session != nullptr)
   {
     if (p_request == session->request_)
@@ -518,6 +525,7 @@ SubmitResult Replica::HandleRequest(std::uint64_t p_client, std::uint64_t p_requ
   entry_header.cluster_ = config_.cluster_;
   entry_header.client_ = p_client;
   entry_header.request_ = p_request;
+  entry_header.session_ = p_session;
   entry_header.op_ = op;
   // Strictly increasing, also when the wall clock goes back.
   entry_header.timestamp_ns_ = std::max(realtime_ns_, timestamp_last_ns_ + 1);
@@ -1249,6 +1257,7 @@ void Replica::ExecuteOne(std::uint64_t p_op)
   internal::ClientEntry commit;
   commit.client_ = entry.client_;
   commit.request_ = entry.request_;
+  commit.session_ = is_registration ? entry.op_ : entry.session_;
   commit.op_ = entry.op_;
   bool committed = false;
   if (is_registration && session == nullptr)
@@ -1256,7 +1265,8 @@ void Replica::ExecuteOne(std::uint64_t p_op)
     clients_.Commit(commit, {});
     committed = true;
   }
-  else if (!is_registration && session != nullptr && session->request_ < entry.request_)
+  else if (!is_registration && session != nullptr && session->session_ == entry.session_ &&
+           session->request_ < entry.request_)
   {
     Operation operation;
     operation.op_ = entry.op_;

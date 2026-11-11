@@ -19,6 +19,7 @@ void Commit(ClientTable &p_table, std::uint64_t p_client, std::uint64_t p_reques
   entry.client_ = p_client;
   entry.request_ = p_request;
   entry.op_ = p_op;
+  entry.session_ = p_client + 100;
   p_table.Commit(entry, Bytes(p_reply));
 }
 
@@ -77,6 +78,7 @@ TEST(ClientTable, SerializedFormDoesNotDependOnInsertOrder)
   ASSERT_NE(copy.Find(3), nullptr);
   EXPECT_EQ(copy.Find(3)->request_, 6U);
   EXPECT_EQ(copy.Find(3)->op_, 42U);
+  EXPECT_EQ(copy.Find(3)->session_, 103U);
   EXPECT_EQ(test::Text(copy.Reply(*copy.Find(3))), "three");
   EXPECT_EQ(test::Text(copy.Reply(*copy.Find(2))), "");
 }

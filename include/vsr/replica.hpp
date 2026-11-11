@@ -109,8 +109,8 @@ public:
   // Submits a request from a host that has its own client protocol. The
   // reply goes to `MessageBus::SendToClient` when the operation commits.
   // Request number 0 with an empty body registers the client. A client
-  // must be registered before its first operation.
-  SubmitResult Submit(std::uint64_t p_client, std::uint64_t p_request,
+  // sends the registration reply session_ with every operation.
+  SubmitResult Submit(std::uint64_t p_client, std::uint64_t p_request, std::uint64_t p_session,
                       std::span<const std::byte> p_body);
 
   // Makes the new log entries durable, then acknowledges them. Call it after
@@ -203,7 +203,7 @@ private:
   void RequestSnapshotChunk();
 
   SubmitResult HandleRequest(std::uint64_t p_client, std::uint64_t p_request,
-                             std::span<const std::byte> p_body);
+                             std::uint64_t p_session, std::span<const std::byte> p_body);
   void OnRequest(const Message &p_message);
   void OnPrepare(const Message &p_message);
   void OnPrepareOk(const Header &p_header);

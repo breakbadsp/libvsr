@@ -12,6 +12,7 @@ namespace vsr::internal
 struct ClientEntry
 {
   std::uint64_t client_ = 0;
+  std::uint64_t session_ = 0;
   // The latest request of the client that is committed.
   std::uint64_t request_ = 0;
   // The operation that committed it.

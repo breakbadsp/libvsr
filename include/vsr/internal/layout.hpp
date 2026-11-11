@@ -18,7 +18,7 @@ inline constexpr std::uint64_t kSnapshotSlotCount = 2;
 }
 
 // Bytes of one client table entry without its reply.
-inline constexpr std::uint64_t kClientEntryBytes = 28;
+inline constexpr std::uint64_t kClientEntryBytes = 36;
 
 [[nodiscard]] constexpr std::uint64_t ClientTableBytesMax(const Config &p_config) noexcept
 {

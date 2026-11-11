@@ -37,7 +37,7 @@ sees the difference halts with `HaltReason::Divergence`.
 replica = Replica::Open(config, storage, bus, state_machine)
 loop:
     for each message that arrived:  replica.OnMessage(bytes)
-    for each request of an own client protocol:  replica.Submit(client, request, body)
+    for each request of an own client protocol:  replica.Submit(client, request, session, body)
     each tick (for example 10 ms):  replica.Tick(wall_clock_ns)
     replica.Flush()
     stop if replica.GetStatus() == Status::Halted
@@ -59,9 +59,11 @@ loop:
 
 - A client has an identifier that is not zero. Before its first operation
   it registers: request number 0 with an empty body. The cluster then keeps
-  a session for it.
+  a session for it. Registration uses session 0. Its reply gives `session_`,
+  the committed registration operation number. Each later request must
+  carry that session number.
 - Operations have request numbers 1, 2, 3, and so on. The identifier and
-  the number identify one logical operation.
+  the session number and the request number identify one logical operation.
 - A client has at most one request in progress.
 - After a timeout the outcome is not known. Send the **same** request
   number again. The operation then executes at most once, and the client

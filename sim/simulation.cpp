@@ -444,6 +444,7 @@ struct Client
   std::uint64_t id_ = 0;
   std::uint64_t request_ = 0;
   std::vector<std::byte> body_;
+  std::uint64_t session_ = 0;
   bool registered_ = false;
   bool waiting_ = false;
   std::uint64_t next_send_tick_ = 0;
@@ -815,6 +816,7 @@ private:
     header.cluster_ = SimulationConfig(options_.replica_count_, 0).cluster_;
     header.client_ = p_client.id_;
     header.request_ = p_client.request_;
+    header.session_ = p_client.session_;
     std::vector<std::byte> bytes(kHeaderBytes + p_client.body_.size());
     const std::size_t message_bytes = EncodeMessage(header, p_client.body_, {}, bytes);
     Packet packet;
@@ -873,6 +875,7 @@ private:
     client_indexes_[p_client.id_] = index;
     p_client.request_ = 0;
     p_client.registered_ = false;
+    p_client.session_ = 0;
     p_client.waiting_ = false;
     p_client.next_send_tick_ = tick_ + random_.Below(kClientThinkTicksMax);
     evictions_ += 1;
@@ -907,13 +910,15 @@ private:
       }
       return;
     }
-    if (!client.waiting_ || header.request_ != client.request_)
+    if (!client.waiting_ || header.request_ != client.request_ ||
+        (client.registered_ && header.session_ != client.session_))
     {
       return;
     }
     if (!client.registered_)
     {
       client.registered_ = true;
+      client.session_ = header.session_;
     }
     else if (!CheckReply(client, *message))
     {

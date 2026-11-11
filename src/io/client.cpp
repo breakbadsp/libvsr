@@ -138,6 +138,7 @@ private:
     header.cluster_ = options_.cluster_;
     header.client_ = options_.client_;
     header.request_ = p_request;
+    header.session_ = p_request == 0 ? 0 : session_;
     message_.resize(kHeaderBytes + p_body.size());
     message_.resize(EncodeMessage(header, p_body, {}, message_));
     message_request_ = p_request;
@@ -168,8 +169,13 @@ private:
             return;
           }
           const Header &header = message->header_;
-          if (header.command_ == Command::Reply && header.request_ == message_request_)
+          if (header.command_ == Command::Reply && header.request_ == message_request_ &&
+              (message_request_ == 0 || header.session_ == session_))
           {
+            if (message_request_ == 0)
+            {
+              session_ = header.session_;
+            }
             view_ = std::max(view_, header.view_);
             reply_.assign(message->body_.begin(), message->body_.end());
             received = Received::Reply;
@@ -306,6 +312,7 @@ private:
   std::uint64_t request_ = 0;
   // The highest view in a reply. The primary of that view gets requests first.
   std::uint32_t view_ = 0;
+  std::uint64_t session_ = 0;
   bool registered_ = false;
   bool pending_ = false;
 };

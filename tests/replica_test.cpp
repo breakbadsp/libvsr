@@ -57,11 +57,12 @@ protected:
   // operation. The reply to a registration is not kept.
   void Register(std::uint64_t p_client)
   {
-    ASSERT_EQ(replica_->Submit(p_client, 0, {}), SubmitResult::Accepted);
+    ASSERT_EQ(replica_->Submit(p_client, 0, 0, {}), SubmitResult::Accepted);
     replica_->Flush();
     ASSERT_FALSE(bus_.replies_.empty());
     ASSERT_EQ(bus_.replies_.back().client_, p_client);
     ASSERT_EQ(bus_.replies_.back().request_, 0U);
+    sessions_[p_client] = bus_.replies_.back().op_;
     bus_.replies_.pop_back();
   }
 
@@ -70,7 +71,8 @@ protected:
                                                    std::string_view p_body)
   {
     const std::size_t reply_count = bus_.replies_.size();
-    if (replica_->Submit(p_client, p_request, Bytes(p_body)) != SubmitResult::Accepted)
+    if (replica_->Submit(p_client, p_request, sessions_[p_client], Bytes(p_body)) !=
+        SubmitResult::Accepted)
     {
       return std::nullopt;
     }
@@ -82,6 +84,7 @@ protected:
     return bus_.replies_.back().body_;
   }
 
+  std::map<std::uint64_t, std::uint64_t> sessions_;
   Config config_ = SmallConfig();
   test::MemoryStorage storage_{StorageBytes(config_)};
   test::RecordingBus bus_;
@@ -143,12 +146,12 @@ TEST_F(SingleReplica, DuplicateRequestGetsStoredReply)
   EXPECT_EQ(Request(1, 2, "a=2"), "1");
   const std::size_t reply_count = bus_.replies_.size();
 
-  EXPECT_EQ(replica_->Submit(1, 2, Bytes("a=2")), SubmitResult::Duplicate);
+  EXPECT_EQ(replica_->Submit(1, 2, sessions_[1], Bytes("a=2")), SubmitResult::Duplicate);
   ASSERT_EQ(bus_.replies_.size(), reply_count + 1);
   EXPECT_EQ(bus_.replies_.back().body_, "1");
   EXPECT_EQ(bus_.replies_.back().op_, 3U);
 
-  EXPECT_EQ(replica_->Submit(1, 1, Bytes("a=1")), SubmitResult::Duplicate);
+  EXPECT_EQ(replica_->Submit(1, 1, sessions_[1], Bytes("a=1")), SubmitResult::Duplicate);
   EXPECT_EQ(bus_.replies_.size(), reply_count + 1);
   EXPECT_EQ(replica_->Op(), 3U);
   EXPECT_EQ(state_machine_->values_.at("a"), "2");
@@ -159,8 +162,8 @@ TEST_F(SingleReplica, DuplicateOfPendingRequestIsNotPreparedAgain)
 {
   Register(1);
   const std::uint64_t op_before = replica_->Op();
-  EXPECT_EQ(replica_->Submit(1, 1, Bytes("a=1")), SubmitResult::Accepted);
-  EXPECT_EQ(replica_->Submit(1, 1, Bytes("a=1")), SubmitResult::Duplicate);
+  EXPECT_EQ(replica_->Submit(1, 1, sessions_[1], Bytes("a=1")), SubmitResult::Accepted);
+  EXPECT_EQ(replica_->Submit(1, 1, sessions_[1], Bytes("a=1")), SubmitResult::Duplicate);
   replica_->Flush();
   EXPECT_EQ(replica_->Op(), op_before + 1);
   EXPECT_EQ(bus_.replies_.size(), 1U);
@@ -178,8 +181,8 @@ TEST_F(SingleReplica, RepliesOnlyAfterFlushAndSyncsOncePerBatch)
   ASSERT_TRUE(Request(3, 1, "c=1").has_value());
   ASSERT_EQ(replica_->CheckpointOp(), 4U);
   bus_.replies_.clear();
-  EXPECT_EQ(replica_->Submit(1, 1, Bytes("a=1")), SubmitResult::Accepted);
-  EXPECT_EQ(replica_->Submit(2, 1, Bytes("b=1")), SubmitResult::Accepted);
+  EXPECT_EQ(replica_->Submit(1, 1, sessions_[1], Bytes("a=1")), SubmitResult::Accepted);
+  EXPECT_EQ(replica_->Submit(2, 1, sessions_[2], Bytes("b=1")), SubmitResult::Accepted);
   EXPECT_TRUE(bus_.replies_.empty());
   const std::uint64_t sync_count = storage_.sync_count_;
   replica_->Flush();
@@ -193,16 +196,17 @@ TEST_F(SingleReplica, RefusesRequestsOverLimits)
   Register(1);
   Register(2);
   Register(3);
-  EXPECT_EQ(replica_->Submit(0, 1, Bytes("a=1")), SubmitResult::Invalid);
-  EXPECT_EQ(replica_->Submit(1, 1, Bytes(std::string(65, 'x'))), SubmitResult::Invalid);
+  EXPECT_EQ(replica_->Submit(0, 1, sessions_[0], Bytes("a=1")), SubmitResult::Invalid);
+  EXPECT_EQ(replica_->Submit(1, 1, sessions_[1], Bytes(std::string(65, 'x'))),
+            SubmitResult::Invalid);
   // A registration has no body.
-  EXPECT_EQ(replica_->Submit(4, 0, Bytes("a=1")), SubmitResult::Invalid);
+  EXPECT_EQ(replica_->Submit(4, 0, 0, Bytes("a=1")), SubmitResult::Invalid);
 
-  EXPECT_EQ(replica_->Submit(1, 1, Bytes("a=1")), SubmitResult::Accepted);
-  EXPECT_EQ(replica_->Submit(2, 1, Bytes("b=1")), SubmitResult::Accepted);
-  EXPECT_EQ(replica_->Submit(3, 1, Bytes("c=1")), SubmitResult::Busy);
+  EXPECT_EQ(replica_->Submit(1, 1, sessions_[1], Bytes("a=1")), SubmitResult::Accepted);
+  EXPECT_EQ(replica_->Submit(2, 1, sessions_[2], Bytes("b=1")), SubmitResult::Accepted);
+  EXPECT_EQ(replica_->Submit(3, 1, sessions_[3], Bytes("c=1")), SubmitResult::Busy);
   replica_->Flush();
-  EXPECT_EQ(replica_->Submit(3, 1, Bytes("c=1")), SubmitResult::Accepted);
+  EXPECT_EQ(replica_->Submit(3, 1, sessions_[3], Bytes("c=1")), SubmitResult::Accepted);
   replica_->Flush();
   EXPECT_EQ(state_machine_->values_.size(), 3U);
 }
@@ -239,7 +243,7 @@ TEST_F(SingleReplica, RestartReplaysTheLog)
   EXPECT_EQ(state_machine_->values_.at("b"), "2");
 
   bus_.replies_.clear();
-  EXPECT_EQ(replica_->Submit(1, 2, Bytes("b=2")), SubmitResult::Duplicate);
+  EXPECT_EQ(replica_->Submit(1, 2, sessions_[1], Bytes("b=2")), SubmitResult::Duplicate);
   ASSERT_EQ(bus_.replies_.size(), 1U);
   EXPECT_EQ(bus_.replies_.back().body_, "");
   EXPECT_EQ(Request(1, 3, "b=3"), "2");
@@ -282,7 +286,7 @@ TEST_F(SingleReplica, FormatErasesOldLog)
   EXPECT_EQ(replica_->Op(), 0U);
   EXPECT_TRUE(state_machine_->values_.empty());
   // The session is gone too.
-  EXPECT_EQ(replica_->Submit(1, 1, Bytes("a=9")), SubmitResult::NoSession);
+  EXPECT_EQ(replica_->Submit(1, 1, sessions_[1], Bytes("a=9")), SubmitResult::NoSession);
   Register(1);
   EXPECT_EQ(Request(1, 1, "a=9"), "");
 }
@@ -291,7 +295,7 @@ TEST_F(SingleReplica, FormatErasesOldLog)
 // operation does not execute.
 TEST_F(SingleReplica, UnregisteredClientIsRefused)
 {
-  EXPECT_EQ(replica_->Submit(9, 1, Bytes("a=1")), SubmitResult::NoSession);
+  EXPECT_EQ(replica_->Submit(9, 1, sessions_[9], Bytes("a=1")), SubmitResult::NoSession);
   replica_->Flush();
   ASSERT_EQ(bus_.evicted_clients_.size(), 1U);
   EXPECT_EQ(bus_.evicted_clients_.back(), 9U);
@@ -313,8 +317,8 @@ TEST_F(SingleReplica, ClientWithoutSessionCannotExecuteAgain)
   }
   const std::uint64_t op_before = replica_->Op();
 
-  EXPECT_EQ(replica_->Submit(1, 1, Bytes("counter=first")), SubmitResult::NoSession);
-  EXPECT_EQ(replica_->Submit(1, 2, Bytes("counter=second")), SubmitResult::NoSession);
+  EXPECT_EQ(replica_->Submit(1, 1, sessions_[1], Bytes("counter=first")), SubmitResult::NoSession);
+  EXPECT_EQ(replica_->Submit(1, 2, sessions_[1], Bytes("counter=second")), SubmitResult::NoSession);
   replica_->Flush();
   EXPECT_EQ(bus_.evicted_clients_, (std::vector<std::uint64_t>{1, 1}));
   EXPECT_EQ(replica_->Op(), op_before);
@@ -324,6 +328,51 @@ TEST_F(SingleReplica, ClientWithoutSessionCannotExecuteAgain)
   EXPECT_EQ(Request(5, 1, "counter=fifth"), "first");
   Register(1);
   EXPECT_EQ(Request(1, 1, "counter=again"), "fifth");
+}
+
+// An operation prepared before eviction must not execute after the eviction
+// commits earlier in the same batch.
+TEST_F(SingleReplica, EvictionBeforeCommitInvalidatesPreparedOperation)
+{
+  Register(1);
+  ASSERT_EQ(Request(1, 1, "counter=first"), "");
+  Register(2);
+  Register(3);
+  Register(4);
+  ASSERT_EQ(replica_->Submit(5, 0, 0, {}), SubmitResult::Accepted);
+  ASSERT_EQ(replica_->Submit(1, 2, sessions_[1], Bytes("counter=duplicate")),
+            SubmitResult::Accepted);
+  replica_->Flush();
+  EXPECT_EQ(state_machine_->values_.at("counter"), "first");
+  EXPECT_EQ(replica_->Submit(1, 2, sessions_[1], Bytes("counter=duplicate")),
+            SubmitResult::NoSession);
+}
+
+// Delayed registration and operation copies cannot revive an evicted session,
+// including after the replacement session is checkpointed and restarted.
+TEST_F(SingleReplica, DelayedRegistrationCannotReplayEvictedOperation)
+{
+  Register(1);
+  const std::uint64_t old_session = sessions_[1];
+  ASSERT_EQ(Request(1, 1, "counter=first"), "");
+  for (std::uint64_t client = 2; client <= 5; ++client)
+  {
+    Register(client);
+  }
+  Register(1);
+  ASSERT_NE(sessions_[1], old_session);
+  EXPECT_EQ(replica_->Submit(1, 1, old_session, Bytes("counter=duplicate")),
+            SubmitResult::NoSession);
+  EXPECT_EQ(state_machine_->values_.at("counter"), "first");
+  ASSERT_EQ(Request(1, 1, "counter=second"), "first");
+  ASSERT_EQ(Request(1, 2, "counter=third"), "second");
+  ASSERT_EQ(Request(1, 3, "counter=fourth"), "third");
+  Start();
+  replica_->Flush();
+  EXPECT_EQ(replica_->Submit(1, 1, old_session, Bytes("counter=duplicate")),
+            SubmitResult::NoSession);
+  EXPECT_EQ(state_machine_->values_.at("counter"), "fourth");
+  EXPECT_EQ(Request(1, 4, "counter=fifth"), "fourth");
 }
 
 // The sessions are part of the checkpoint: after a restart, a duplicate
@@ -341,10 +390,10 @@ TEST_F(SingleReplica, SessionsSurviveRestartFromCheckpoint)
   Start();
   replica_->Flush();
   bus_.replies_.clear();
-  EXPECT_EQ(replica_->Submit(2, 12, Bytes("k=12")), SubmitResult::Duplicate);
+  EXPECT_EQ(replica_->Submit(2, 12, sessions_[2], Bytes("k=12")), SubmitResult::Duplicate);
   ASSERT_EQ(bus_.replies_.size(), 1U);
   EXPECT_EQ(bus_.replies_.back().body_, "11");
-  EXPECT_EQ(replica_->Submit(7, 1, Bytes("k=x")), SubmitResult::NoSession);
+  EXPECT_EQ(replica_->Submit(7, 1, sessions_[7], Bytes("k=x")), SubmitResult::NoSession);
   EXPECT_EQ(state_machine_->values_.at("k"), "12");
 }
 

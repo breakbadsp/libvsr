@@ -50,8 +50,8 @@ MUTATIONS = {
         "    if (p_request <= session->request_)\n    {\n      return SubmitResult::Duplicate;\n    }",
         "    if (p_request < session->request_)\n    {\n      return SubmitResult::Duplicate;\n    }"),
         (REPLICA,
-        "  else if (!is_registration && session != nullptr && session->request_ < entry.request_)",
-        "  else if (!is_registration && session != nullptr && session->request_ <= entry.request_)")], []),
+        "  else if (!is_registration && session != nullptr && session->session_ == entry.session_ &&\n           session->request_ < entry.request_)",
+        "  else if (!is_registration && session != nullptr && session->session_ == entry.session_ &&\n           session->request_ <= entry.request_)")], []),
     "timestamp-from-wall-clock": ([(REPLICA,
         "std::max(realtime_ns_, timestamp_last_ns_ + 1);", "realtime_ns_;")], []),
     # Needs more clients than the client table holds: 12 clients, 8 sessions.
@@ -59,7 +59,7 @@ MUTATIONS = {
         "  if (session == nullptr && !is_registration)\n  {\n    // Without a session",
         "  if (false && session == nullptr && !is_registration)\n  {\n    // Without a session"),
         (REPLICA,
-        "  else if (!is_registration && session != nullptr && session->request_ < entry.request_)",
+        "  else if (!is_registration && session != nullptr && session->session_ == entry.session_ &&\n           session->request_ < entry.request_)",
         "  else if (!is_registration && (session == nullptr || session->request_ < entry.request_))")],
         ["4000", "12"]),
 }

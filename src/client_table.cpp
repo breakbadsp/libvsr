@@ -72,6 +72,7 @@ void ClientTable::Commit(const ClientEntry &p_commit, std::span<const std::byte>
     free_slot_indexes_.pop_back();
     position = entries_.insert(position, fresh);
   }
+  position->session_ = p_commit.session_;
   position->request_ = p_commit.request_;
   position->op_ = p_commit.op_;
   position->reply_bytes_ = static_cast<std::uint32_t>(p_reply.size());
@@ -88,6 +89,7 @@ std::size_t ClientTable::Serialize(std::span<std::byte> p_out) const
   for (const auto &entry : entries_)
   {
     writer.Put(entry.client_);
+    writer.Put(entry.session_);
     writer.Put(entry.request_);
     writer.Put(entry.op_);
     writer.Put(entry.reply_bytes_);
@@ -109,10 +111,11 @@ std::optional<std::size_t> ClientTable::Deserialize(std::span<const std::byte> p
   for (std::uint32_t entry_index = 0; entry_index < *count; ++entry_index)
   {
     const auto client = reader.Get<std::uint64_t>();
+    const auto session = reader.Get<std::uint64_t>();
     const auto request = reader.Get<std::uint64_t>();
     const auto op = reader.Get<std::uint64_t>();
     const auto reply_bytes = reader.Get<std::uint32_t>();
-    if (!client || !request || !op || !reply_bytes || *reply_bytes > body_bytes_max_)
+    if (!client || !session || !request || !op || !reply_bytes || *reply_bytes > body_bytes_max_)
     {
       return std::nullopt;
     }
@@ -129,6 +132,7 @@ std::optional<std::size_t> ClientTable::Deserialize(std::span<const std::byte> p
     client_previous = *client;
     ClientEntry entry;
     entry.client_ = *client;
+    entry.session_ = *session;
     entry.request_ = *request;
     entry.op_ = *op;
     Commit(entry, *reply);

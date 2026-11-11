@@ -14,7 +14,7 @@ namespace vsr::internal
 namespace
 {
 
-constexpr std::uint16_t kStorageVersion = 1;
+constexpr std::uint16_t kStorageVersion = 2;
 
 [[nodiscard]] std::uint64_t SuperblockChecksum(const Superblock &p_superblock) noexcept
 {
