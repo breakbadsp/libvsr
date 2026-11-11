@@ -1,0 +1,27 @@
+{
+  "version": 6,
+  "configurePresets": [
+    { "name": "base", "hidden": true, "generator": "Ninja",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" } },
+    { "name": "gcc", "inherits": "base", "binaryDir": "build/gcc",
+      "cacheVariables": { "CMAKE_CXX_COMPILER": "g++" } },
+    { "name": "clang", "inherits": "base", "binaryDir": "build/clang",
+      "cacheVariables": { "CMAKE_CXX_COMPILER": "clang++" } },
+    { "name": "gcc-san", "inherits": "gcc", "binaryDir": "build/gcc-san",
+      "cacheVariables": { "VSR_ENABLE_ASAN": "ON", "VSR_ENABLE_UBSAN": "ON" } },
+    { "name": "clang-san", "inherits": "clang", "binaryDir": "build/clang-san",
+      "cacheVariables": { "VSR_ENABLE_ASAN": "ON", "VSR_ENABLE_UBSAN": "ON" } }
+  ],
+  "buildPresets": [
+    { "name": "gcc", "configurePreset": "gcc" },
+    { "name": "clang", "configurePreset": "clang" },
+    { "name": "gcc-san", "configurePreset": "gcc-san" },
+    { "name": "clang-san", "configurePreset": "clang-san" }
+  ],
+  "testPresets": [
+    { "name": "gcc", "configurePreset": "gcc", "output": { "outputOnFailure": true } },
+    { "name": "clang", "configurePreset": "clang", "output": { "outputOnFailure": true } },
+    { "name": "gcc-san", "configurePreset": "gcc-san", "output": { "outputOnFailure": true } },
+    { "name": "clang-san", "configurePreset": "clang-san", "output": { "outputOnFailure": true } }
+  ]
+}

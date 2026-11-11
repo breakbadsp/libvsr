@@ -1,0 +1,7 @@
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_executable(vsr_decode_fuzz decode_fuzz.cpp)
+  target_compile_features(vsr_decode_fuzz PRIVATE cxx_std_23)
+  target_link_libraries(vsr_decode_fuzz PRIVATE vsr vsr_options)
+  target_compile_options(vsr_decode_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_options(vsr_decode_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+endif()

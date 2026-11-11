@@ -1,0 +1,32 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+        mode: [plain, sanitizers]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y g++-14 clang-18 ninja-build libgtest-dev
+      - name: Configure, build, test, and soak
+        shell: bash
+        run: |
+          preset=${{ matrix.compiler }}
+          compiler=g++-14
+          if [[ $preset == clang ]]; then compiler=clang++-18; fi
+          if [[ ${{ matrix.mode }} == sanitizers ]]; then preset=$preset-san; fi
+          cmake --preset "$preset" -DCMAKE_CXX_COMPILER="$compiler"
+          cmake --build --preset "$preset"
+          ctest --preset "$preset"
+          ./build/$preset/sim/vsr_sim 1 300 3
+          ./build/$preset/sim/vsr_sim 1 300 5
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y g++-14 clang-18 ninja-build libgtest-dev
+      - run: cmake --preset clang -DCMAKE_CXX_COMPILER=clang++-18 -DVSR_BUILD_FUZZ=ON
+      - run: cmake --build --preset clang --target vsr_decode_fuzz
+      - run: ./build/clang/fuzz/vsr_decode_fuzz -max_total_time=60

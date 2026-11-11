@@ -1,0 +1,55 @@
+{
+  "retrieved": "2026-11-07",
+  "papers": [
+    {
+      "file": "vr-revisited-2012.pdf",
+      "title": "Viewstamped Replication Revisited",
+      "authors": "Barbara Liskov; James Cowling",
+      "year": "2012",
+      "source": "https://dspace.mit.edu/entities/publication/80846d94-fcd3-40e6-87fb-8d91fe99a5d1",
+      "download_url": "https://www.cs.princeton.edu/courses/archive/fall19/cos418/papers/vr-revisited.pdf",
+      "sha256": "1b16284a0a443d08992bd0fd0f032587e34e3e81f61f1871d39a4e4a6e22cfa6",
+      "pages": 14
+    },
+    {
+      "file": "vr-original-1988.pdf",
+      "title": "Viewstamped Replication: A New Primary Copy Method to Support Highly-Available Distributed Systems",
+      "authors": "Brian M. Oki; Barbara H. Liskov",
+      "year": "1988",
+      "source": "https://doi.org/10.1145/62546.62549",
+      "download_url": "https://www.cs.cmu.edu/~gibbons/15-712/papers/oki88.pdf",
+      "sha256": "ebaf3c9159a06203da7fadbd88b0ef8b5435a2bac7cba69a19617a5f68b66f92",
+      "pages": 10
+    },
+    {
+      "file": "state-machine-tutorial-1990.pdf",
+      "title": "Implementing Fault-tolerant Services using the State Machine Approach: A Tutorial",
+      "authors": "Fred B. Schneider",
+      "year": "1986, revised January 1990",
+      "source": "https://www.cs.cornell.edu/fbs/publications/86-800.pdf",
+      "download_url": "https://www.cs.cornell.edu/fbs/publications/86-800.pdf",
+      "sha256": "695f779c371c6fdfe80b2e39ee22d448aa903b6d4791f0e3e45f2dc798673218",
+      "pages": 32
+    },
+    {
+      "file": "paxos-vr-zab-2014.pdf",
+      "title": "Vive la Différence: Paxos vs. Viewstamped Replication vs. Zab",
+      "authors": "Robbert van Renesse; Nicolas Schiper; Fred B. Schneider",
+      "year": "2014 (arXiv v3; first submitted 2013)",
+      "source": "https://arxiv.org/abs/1309.5671v3",
+      "download_url": "https://arxiv.org/pdf/1309.5671v3",
+      "sha256": "a525e01e3378435ef380d82d301d59341d9ce90b69e1e92f80d261b38124348e",
+      "pages": 16
+    },
+    {
+      "file": "protocol-aware-recovery-2018.pdf",
+      "title": "Protocol-Aware Recovery for Consensus-Based Storage",
+      "authors": "Ramnatthan Alagappan; Aishwarya Ganesan; Eric Lee; Aws Albarghouthi; Vijay Chidambaram; Andrea C. Arpaci-Dusseau; Remzi H. Arpaci-Dusseau",
+      "year": "2018",
+      "source": "https://www.usenix.org/conference/fast18/presentation/alagappan",
+      "download_url": "https://www.usenix.org/system/files/conference/fast18/fast18-alagappan.pdf",
+      "sha256": "b18cc6fc2d6605e54a153697b608ac3d60bc363bacd6a8395860430286af5dc5",
+      "pages": 18
+    }
+  ]
+}
