@@ -105,7 +105,6 @@ public:
 
   [[nodiscard]] std::expected<void, HaltReason> Run()
   {
-    stop_.store(false);
     while (!stop_.load())
     {
       const std::uint64_t now_ns = internal::MonotonicNs();

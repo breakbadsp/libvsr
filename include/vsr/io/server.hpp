@@ -43,7 +43,8 @@ public:
   Server &operator=(const Server &) = delete;
   ~Server();
 
-  // Serves until `Stop` is called. Returns the reason if the replica halts.
+  // Serves until `Stop` is called. A stop before this call also takes effect.
+  // A stopped server cannot run again. Returns the reason if the replica halts.
   [[nodiscard]] std::expected<void, HaltReason> Run();
 
   // Makes `Run` return. Safe to call from another thread.

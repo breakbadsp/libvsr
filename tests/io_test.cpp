@@ -4,6 +4,7 @@
 #include "vsr/io/server.hpp"
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -197,6 +198,43 @@ TEST(FileStorage, MakesFileAndRefusesOtherSize)
   }
   EXPECT_EQ(std::filesystem::file_size(path), 8192U);
   EXPECT_FALSE(FileStorage::Open(path.string(), 4096).has_value());
+  std::filesystem::remove(path);
+}
+
+// A stop before loop entry must not be cleared by the worker thread.
+TEST(Server, StopBeforeRunReturns)
+{
+  const auto path =
+      std::filesystem::temp_directory_path() / std::format("vsr_server_stop_test_{}", ::getpid());
+  std::filesystem::remove(path);
+  test::KeyValueStateMachine state_machine;
+  ServerOptions options;
+  options.config_.cluster_ = 77;
+  options.config_.replica_count_ = 1;
+  options.config_.body_bytes_max_ = 4096;
+  options.config_.log_slot_count_ = 64;
+  options.config_.checkpoint_interval_ = 16;
+  options.config_.snapshot_bytes_max_ = 64 * 1024;
+  options.addresses_ = {std::format("127.0.0.1:{}", FreePort())};
+  options.data_path_ = path.string();
+  auto server = Server::Create(std::move(options), state_machine);
+  ASSERT_TRUE(server.has_value()) << server.error();
+  server->Stop();
+  std::atomic<bool> finished{false};
+  std::jthread worker{[server_pointer = &*server, finished_pointer = &finished]()
+                      {
+                        static_cast<void>(server_pointer->Run());
+                        finished_pointer->store(true);
+                      }};
+  const auto deadline = std::chrono::steady_clock::now() + 1s;
+  while (!finished.load() && std::chrono::steady_clock::now() < deadline)
+  {
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_TRUE(finished.load());
+  // A second stop releases a faulty implementation so the test can report it.
+  server->Stop();
+  worker.join();
   std::filesystem::remove(path);
 }
 
