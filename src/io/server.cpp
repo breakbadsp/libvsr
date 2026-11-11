@@ -385,6 +385,15 @@ private:
       // The replica sends again what the protocol needs.
       return;
     }
+    // Reclaim each consumed prefix before appending. Otherwise a connection
+    // that never drains retains bytes from every earlier partial send.
+    if (connection.out_offset_ != 0)
+    {
+      std::memmove(connection.out_.data(), connection.out_.data() + connection.out_offset_,
+                   queued_bytes);
+      connection.out_.resize(queued_bytes);
+      connection.out_offset_ = 0;
+    }
     connection.out_.insert(connection.out_.end(), p_message.begin(), p_message.end());
     if (!connection.connecting_)
     {
