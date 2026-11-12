@@ -142,6 +142,8 @@ private:
     message_.resize(kHeaderBytes + p_body.size());
     message_.resize(EncodeMessage(header, p_body, {}, message_));
     message_request_ = p_request;
+    primary_only_ = true;
+    next_send_ns_ = 0;
   }
 
   enum class Received
@@ -203,9 +205,13 @@ private:
     // Two steps at most: the registration, then the operation.
     while (true)
     {
+      // Encode a message once: `Resume` continues the message in progress.
       if (!registered_)
       {
-        Encode(0, {});
+        if (message_request_ != 0)
+        {
+          Encode(0, {});
+        }
       }
       else if (message_request_ != request_ + 1)
       {
@@ -242,25 +248,25 @@ private:
   // deadline passes.
   [[nodiscard]] Received Exchange(std::uint64_t p_deadline_ns)
   {
-    std::uint64_t next_send_ns = internal::MonotonicNs();
-    bool first_send = true;
     while (true)
     {
       std::uint64_t now_ns = internal::MonotonicNs();
-      if (now_ns >= next_send_ns)
+      if (now_ns >= next_send_ns_)
       {
         // The primary alone at first. If it does not answer, every replica:
         // the primary can be a different one now, and it replies on the
-        // connection that carried the request.
+        // connection that carried the request. This state belongs to the
+        // message, not to the call: a caller with a timeout shorter than the
+        // retry interval must also reach every replica.
         for (std::size_t replica = 0; replica < addresses_.size(); ++replica)
         {
-          if (!first_send || replica == view_ % addresses_.size())
+          if (!primary_only_ || replica == view_ % addresses_.size())
           {
             Send(replica);
           }
         }
-        first_send = false;
-        next_send_ns = now_ns + options_.retry_ms_ * kNsPerMs;
+        primary_only_ = false;
+        next_send_ns_ = now_ns + options_.retry_ms_ * kNsPerMs;
       }
       std::vector<pollfd> waiters;
       std::vector<std::size_t> replicas;
@@ -273,7 +279,7 @@ private:
         }
       }
       now_ns = internal::MonotonicNs();
-      const std::uint64_t wake_ns = std::min(p_deadline_ns, next_send_ns);
+      const std::uint64_t wake_ns = std::min(p_deadline_ns, next_send_ns_);
       const std::uint64_t wait_ns = wake_ns > now_ns ? wake_ns - now_ns : 0;
       const int wait_ms = static_cast<int>((wait_ns + kNsPerMs - 1) / kNsPerMs);
       const int ready_count = ::poll(waiters.data(), waiters.size(), wait_ms);
@@ -307,6 +313,10 @@ private:
   // The encoded message in progress, and its request number.
   std::vector<std::byte> message_;
   std::uint64_t message_request_ = kNoRequest;
+  // The message in progress went to the supposed primary only, or not yet.
+  bool primary_only_ = true;
+  // When to send the message in progress again. 0: now.
+  std::uint64_t next_send_ns_ = 0;
   std::vector<std::byte> reply_;
   // The last request number that got its reply.
   std::uint64_t request_ = 0;

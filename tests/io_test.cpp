@@ -346,6 +346,24 @@ TEST_F(Cluster, ContinuesWhileEachReplicaRestarts)
   }
 }
 
+// A caller can wait in steps shorter than the retry interval. The client
+// must still send to every replica, or it never finds a primary that is not
+// the one it supposes.
+TEST_F(Cluster, FindsThePrimaryWithShortWaits)
+{
+  Stop(0); // a new client supposes that replica 0 is the primary
+  Client client = MakeClient();
+  constexpr auto kShortWait = 10ms; // the retry interval is 50 ms
+  auto reply = client.Request(Bytes("key=value"), kShortWait);
+  const auto deadline = std::chrono::steady_clock::now() + kRequestTimeout;
+  while (!reply.has_value() && reply.error() == ClientError::Timeout &&
+         std::chrono::steady_clock::now() < deadline)
+  {
+    reply = client.Resume(kShortWait);
+  }
+  EXPECT_TRUE(reply.has_value());
+}
+
 // After every replica stops at the same time, the cluster starts again from
 // its files with every acknowledged operation.
 TEST_F(Cluster, KeepsStateWhenAllReplicasRestart)
