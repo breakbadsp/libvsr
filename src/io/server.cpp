@@ -2,8 +2,10 @@
 
 #include "socket.hpp"
 #include "vsr/assert.hpp"
+#include "vsr/internal/layout.hpp"
 #include "vsr/io/file_storage.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -484,6 +486,25 @@ Server::Server(Server &&) noexcept = default;
 Server &Server::operator=(Server &&) noexcept = default;
 Server::~Server() = default;
 
+namespace
+{
+
+// A power loss can stop the first start after the file exists on storage and
+// before the superblock does. The replica acknowledged nothing then, so a
+// file whose superblock sectors are all zero is formatted again.
+[[nodiscard]] bool HasSuperblockData(FileStorage &p_storage)
+{
+  std::vector<std::byte> sectors(vsr::internal::kSuperblockCopyCount * vsr::internal::kSectorBytes);
+  if (!p_storage.Read(0, sectors))
+  {
+    // Let `Replica::Open` report the fault.
+    return true;
+  }
+  return std::ranges::any_of(sectors, [](std::byte p_byte) { return p_byte != std::byte{0}; });
+}
+
+} // namespace
+
 std::expected<Server, std::string> Server::Create(ServerOptions p_options,
                                                   StateMachine &p_state_machine)
 {
@@ -511,7 +532,8 @@ std::expected<Server, std::string> Server::Create(ServerOptions p_options,
     return std::unexpected(
         std::format("cannot open '{}': {}", p_options.data_path_, opened.error().message()));
   }
-  if (opened->created_ && !Format(opened->storage_, p_options.config_))
+  if ((opened->created_ || !HasSuperblockData(opened->storage_)) &&
+      !Format(opened->storage_, p_options.config_))
   {
     return std::unexpected(std::format("cannot format '{}'", p_options.data_path_));
   }

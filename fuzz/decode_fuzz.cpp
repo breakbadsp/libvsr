@@ -1,5 +1,6 @@
 #include "vsr/assert.hpp"
 #include "vsr/internal/client_table.hpp"
+#include "vsr/internal/layout.hpp"
 #include "vsr/message.hpp"
 
 #include <algorithm>
@@ -28,7 +29,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *p_data, std::size_t p_
   const auto consumed = table.Deserialize(input);
   if (consumed)
   {
-    std::vector<std::byte> encoded(4 + 16 * (28 + 1024));
+    std::vector<std::byte> encoded(4 + 16 * (vsr::internal::kClientEntryBytes + 1024));
     const auto size = table.Serialize(encoded);
     VSR_ASSERT(size == *consumed);
     VSR_ASSERT(std::equal(encoded.begin(), encoded.begin() + static_cast<std::ptrdiff_t>(size),
