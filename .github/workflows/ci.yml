@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      include_almalinux_9:
+        description: Also test AlmaLinux 9
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: AlmaLinux ${{ matrix.version }} / ${{ matrix.check }}
+    # Outside code stays on GitHub runners, away from the owner's computer.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || fromJSON('["self-hosted", "Linux", "X64", "libvsr"]') }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(inputs.include_almalinux_9 && '["8", "9"]' || '["8"]') }}
+        check: [gcc, clang, gcc-san, clang-san, fuzz]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Build and test in AlmaLinux
+        env:
+          ALMA_VERSION: ${{ matrix.version }}
+          CI_CHECK: ${{ matrix.check }}
+        run: |
+          mkdir -p reports
+          git rev-parse HEAD > reports/commit.txt
+          image="$(bash .github/scripts/almalinux-image.sh)"
+          docker image inspect "$image" > reports/image.json
+          docker run --rm --cap-drop ALL --security-opt no-new-privileges \
+            -e ALMA_VERSION -e CI_CHECK \
+            -v "$PWD:/source:ro" -v "$PWD/reports:/reports" \
+            "$image" bash /source/.github/scripts/almalinux-build.sh
+      - name: Save build and test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: almalinux-${{ matrix.version }}-${{ matrix.check }}
+          path: reports/
+          retention-days: 14
