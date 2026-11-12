@@ -207,7 +207,9 @@ TEST(FileStorage, OpensUnderAncestorWithoutReadAccess)
 {
   if (::geteuid() == 0)
   {
-    GTEST_SKIP() << "root ignores directory modes";
+    // Root ignores directory modes, so the test proves nothing. The
+    // AlmaLinux 8 GoogleTest has no GTEST_SKIP.
+    return;
   }
   const auto root =
       std::filesystem::temp_directory_path() / std::format("vsr_ancestor_test_{}", ::getpid());
