@@ -201,6 +201,26 @@ TEST(FileStorage, MakesFileAndRefusesOtherSize)
   std::filesystem::remove(path);
 }
 
+// An ancestor that denies read access must not stop the open. Home
+// directories often have this mode.
+TEST(FileStorage, OpensUnderAncestorWithoutReadAccess)
+{
+  if (::geteuid() == 0)
+  {
+    GTEST_SKIP() << "root ignores directory modes";
+  }
+  const auto root =
+      std::filesystem::temp_directory_path() / std::format("vsr_ancestor_test_{}", ::getpid());
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root / "data");
+  std::filesystem::permissions(root, std::filesystem::perms::owner_write |
+                                         std::filesystem::perms::owner_exec);
+  const auto opened = FileStorage::Open((root / "data" / "file").string(), 8192);
+  std::filesystem::permissions(root, std::filesystem::perms::owner_all);
+  EXPECT_TRUE(opened.has_value());
+  std::filesystem::remove_all(root);
+}
+
 // A stop before loop entry must not be cleared by the worker thread.
 TEST(Server, StopBeforeRunReturns)
 {

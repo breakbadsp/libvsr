@@ -31,23 +31,15 @@ namespace
   {
     return std::unexpected(error);
   }
-  // Persist both names when the caller uses a symlink. A new directory
-  // also needs its name persisted in its parent, including on an Open retry.
-  for (auto directory : {absolute.parent_path(), resolved.parent_path()})
+  // Persist the name in the directory of the path, and in the directory of the
+  // resolved file when the caller uses a symlink. An ancestor can deny read
+  // access to this process, so the host makes its own directories durable.
+  for (const auto &directory : {absolute.parent_path(), resolved.parent_path()})
   {
-    while (true)
+    UniqueFd fd{::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+    if (!fd.IsOpen() || ::fsync(fd.Get()) != 0)
     {
-      UniqueFd fd{::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
-      if (!fd.IsOpen() || ::fsync(fd.Get()) != 0)
-      {
-        return std::unexpected(LastError());
-      }
-      const auto parent = directory.parent_path();
-      if (parent == directory)
-      {
-        break;
-      }
-      directory = parent;
+      return std::unexpected(LastError());
     }
   }
   return {};
