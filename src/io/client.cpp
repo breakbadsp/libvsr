@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <limits>
 #include <optional>
 #include <poll.h>
 #include <random>
@@ -29,6 +30,20 @@ constexpr int kConnectWaitMs = 50;
     id = (std::uint64_t{device()} << 32) | device();
   }
   return id;
+}
+
+// The time at which a wait that starts at `p_now_ns` ends. A timeout that
+// the clock cannot hold gives the largest time, which never comes.
+[[nodiscard]] std::uint64_t DeadlineNs(std::uint64_t p_now_ns,
+                                       std::chrono::milliseconds p_timeout) noexcept
+{
+  constexpr std::uint64_t kNever = std::numeric_limits<std::uint64_t>::max();
+  const auto timeout_ms = static_cast<std::uint64_t>(std::max<std::int64_t>(p_timeout.count(), 0));
+  if (timeout_ms > (kNever - p_now_ns) / kNsPerMs)
+  {
+    return kNever;
+  }
+  return p_now_ns + timeout_ms * kNsPerMs;
 }
 
 } // namespace
@@ -199,9 +214,7 @@ private:
   [[nodiscard]] std::expected<std::vector<std::byte>, ClientError>
   Wait(std::chrono::milliseconds p_timeout)
   {
-    const std::uint64_t deadline_ns =
-        internal::MonotonicNs() +
-        static_cast<std::uint64_t>(std::max<std::int64_t>(p_timeout.count(), 0)) * kNsPerMs;
+    const std::uint64_t deadline_ns = DeadlineNs(internal::MonotonicNs(), p_timeout);
     // Two steps at most: the registration, then the operation.
     while (true)
     {
