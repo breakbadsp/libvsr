@@ -122,26 +122,23 @@ has three mutated configurations, and TLC finds a counterexample for each.
 The bounds are small: three replicas, at most three views, and a log of
 one to three entries. The model does not prove the protocol for all sizes.
 
-## Known defect
+## Defect that the simulator found
 
-Seed 1780 with three replicas fails with `replica 0 executed a different
-operation at op 15`. It is the only failure in seeds 1 to 20000. The cause
-is in the journal, not in the simulator:
+Seed 1780 with three replicas failed with `replica 0 executed a different
+operation at op 15`. About one fresh seed in 5000 failed for the same
+cause, in the journal:
 
-1. A power loss loses the unsynced entry 14 and keeps the unsynced entry
-   15. Recovery stops at entry 13, and the old entry 15 stays in its slot.
-2. In the next view the replica gets the same entry 14 again from the new
-   primary. The old entry 15 now links to the head of the log.
-3. After one more restart, recovery reads the old entry 15 as a part of
-   the log. The replica is a backup in an open view, so it does not check
-   its log against the primary. It executes the old entry 15, and the
-   primary commits a different entry 15.
+1. A power loss lost the unsynced entry 14 and kept the unsynced entry
+   15. Recovery stopped at entry 13, and the old entry 15 stayed in its slot.
+2. In the next view the replica got the same entry 14 again from the new
+   primary. The old entry 15 then linked to the head of the log.
+3. After one more restart, recovery read the old entry 15 as a part of
+   the log. The replica was a backup in an open view, so it did not check
+   its log against the primary. It executed the old entry 15, and the
+   primary committed a different entry 15.
 
-`TruncateTo` also erases only one slot, and the later entries stay on
-storage. No seed failed through that path, but the same sequence applies to
-it. A possible correction is to erase each entry after the head, in
-recovery and in truncation. The test
-`Simulation.DISABLED_StaleEntryAfterLostWrite` runs this seed.
+Recovery now erases each entry after the head, and truncation erases each
+removed entry. The test `Simulation.StaleEntryAfterLostWrite` runs the seed.
 
 ## Known gaps
 

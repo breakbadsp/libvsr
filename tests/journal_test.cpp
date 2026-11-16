@@ -93,8 +93,10 @@ TEST(Journal, RecoveryStopsAtDamage)
   }
 }
 
-// This checks durable truncation and retained later slots by reading their bytes.
-TEST(Journal, TruncateLeavesLaterSlots)
+// This checks that truncation removes each later entry. The journal gets
+// the entry after the new head again, and the old entry after that one must
+// not be a part of the log when the storage opens again.
+TEST(Journal, TruncateErasesLaterEntries)
 {
   Config config;
   const auto layout = MakeLayout(config);
@@ -105,15 +107,38 @@ TEST(Journal, TruncateLeavesLaterSlots)
   Append(journal, "one");
   Append(journal, "two");
   Append(journal, "three");
-  const auto old = storage.bytes_;
   ASSERT_TRUE(journal.TruncateTo(1));
-  EXPECT_TRUE(std::equal(storage.bytes_.begin() + static_cast<std::ptrdiff_t>(layout.SlotOffset(3)),
-                         storage.bytes_.begin() +
-                             static_cast<std::ptrdiff_t>(layout.SlotOffset(3) + layout.slot_bytes_),
-                         old.begin() + static_cast<std::ptrdiff_t>(layout.SlotOffset(3))));
+  Append(journal, "two");
+  ASSERT_TRUE(journal.Sync());
   Journal recovered{&storage, layout};
   ASSERT_TRUE(recovered.Recover(0, root));
-  EXPECT_EQ(recovered.Head(), 1U);
+  EXPECT_EQ(recovered.Head(), 2U);
+}
+
+// This checks recovery after a power loss that lost one entry and kept the
+// entry after it. The journal gets the lost entry again, and the old entry
+// after it must not be a part of the log when the storage opens again.
+TEST(Journal, RecoveryErasesEntryAfterLostEntry)
+{
+  Config config;
+  const auto layout = MakeLayout(config);
+  test::MemoryStorage storage{layout.total_bytes_};
+  Journal journal{&storage, layout};
+  const auto root = RootChecksum(config.cluster_);
+  ASSERT_TRUE(journal.Recover(0, root));
+  Append(journal, "one");
+  Append(journal, "two");
+  Append(journal, "three");
+  std::fill_n(storage.bytes_.begin() + static_cast<std::ptrdiff_t>(layout.SlotOffset(2)),
+              kEntryHeaderBytes, std::byte{0});
+  Journal recovered{&storage, layout};
+  ASSERT_TRUE(recovered.Recover(0, root));
+  ASSERT_EQ(recovered.Head(), 1U);
+  Append(recovered, "two");
+  ASSERT_TRUE(recovered.Sync());
+  Journal again{&storage, layout};
+  ASSERT_TRUE(again.Recover(0, root));
+  EXPECT_EQ(again.Head(), 2U);
 }
 
 // This checks ring recovery on both sides of a checkpoint after multiple laps.

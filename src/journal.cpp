@@ -60,6 +60,28 @@ std::expected<void, StorageError> Journal::Recover(std::uint64_t p_checkpoint_op
     parent = header.checksum_;
   }
 
+  // An entry after the head is not part of the log: a power loss can keep
+  // an unsynced entry and lose the entry before it. Erase each such entry.
+  // If it stays, it links to the head again when this replica gets the lost
+  // entry a second time, and the next recovery reads it as a part of the log.
+  for (std::uint64_t op = head_op_ + 1; op < head_op_ + layout_.slot_count_; ++op)
+  {
+    EntryHeader header;
+    const auto found = ReadSlot(op, header);
+    if (!found)
+    {
+      return std::unexpected(found.error());
+    }
+    if (!*found)
+    {
+      continue;
+    }
+    if (const auto erased = EraseSlot(op); !erased)
+    {
+      return erased;
+    }
+  }
+
   // Backward from the checkpoint. These entries are committed. They let this
   // replica send old entries to a replica that is behind.
   while (floor_op_ > 0 && head_op_ - floor_op_ < layout_.slot_count_)
@@ -161,8 +183,16 @@ std::expected<void, StorageError> Journal::TruncateTo(std::uint64_t p_op)
   {
     return {};
   }
-  // Later entries can stay on storage: they link to the erased entry, or to
-  // an entry that this slot will not hold again, so recovery ignores them.
+  // Erase the later entries first. If one stays, it links to the head again
+  // when this replica gets the entry before it a second time. After a power
+  // loss during this loop, the log is a shorter part of the old log.
+  for (std::uint64_t op = head_op_; op > p_op + 1; --op)
+  {
+    if (const auto erased = EraseSlot(op); !erased)
+    {
+      return erased;
+    }
+  }
   if (const auto erased = EraseSlot(p_op + 1); !erased)
   {
     return erased;

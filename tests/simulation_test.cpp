@@ -287,12 +287,13 @@ TEST(Simulation, TraceIsDeterministic)
   EXPECT_GT(count(" state "), 0U);
 }
 
-// A known defect in the journal, see "Known defect" in docs/verification.md.
-// A power loss loses one unsynced entry and keeps the entry after it. When
-// the replica gets the lost entry again, the old entry after it becomes a
-// part of the log at the next restart. Enable this test with the correction.
-// If the simulator changes, the seed can stop to show the defect.
-TEST(Simulation, DISABLED_StaleEntryAfterLostWrite)
+// A power loss loses one unsynced entry and keeps the entry after it. The
+// replica then gets the lost entry again from the next primary. The old
+// entry after it must not become a part of the log at the next restart.
+// This seed has that sequence: before the correction in the journal, the
+// replica executed the old entry. If the simulator changes its use of
+// random numbers, the seed can stop to show the sequence.
+TEST(Simulation, StaleEntryAfterLostWrite)
 {
   Options options;
   options.seed_ = 1780;
