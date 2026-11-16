@@ -846,9 +846,6 @@ TEST(ClientCore, LossyNetworkNeverCompletesARequestTwice)
   EXPECT_GT(total.replies_, kSeedCount);
   EXPECT_GT(total.evictions_, 0U);
   EXPECT_GT(total.timeouts_, 0U);
-  RecordProperty("replies", static_cast<std::int64_t>(total.replies_));
-  RecordProperty("evictions", static_cast<std::int64_t>(total.evictions_));
-  RecordProperty("timeouts", static_cast<std::int64_t>(total.timeouts_));
 }
 
 // One seed gives one behaviour.
