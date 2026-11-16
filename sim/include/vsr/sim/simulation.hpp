@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // A deterministic simulation of a cluster. It runs the production replica
@@ -54,6 +55,12 @@ using ApplicationFactory = std::function<std::unique_ptr<Application>()>;
 // must not be larger than `Limits::body_bytes_max_`.
 using BodyGenerator = std::function<std::vector<std::byte>(std::uint64_t p_random)>;
 
+// Gets one line, without a line end, for each event of a run: a fault, a
+// message that is sent, delivered, or dropped, a crash, a start, and a
+// change of the view, the status, or the executed operation of a replica.
+// Each line starts with the tick.
+using TraceSink = std::function<void(std::string_view p_line)>;
+
 // The replica limits that the simulation uses. The defaults are small, so
 // that a short run reaches the ring limit, checkpoints, and snapshot
 // transfer. Each field has the meaning of the `vsr::Config` field with the
@@ -99,6 +106,8 @@ struct Options
   ApplicationFactory application_factory_;
   // Empty: a body has a random size and random bytes.
   BodyGenerator body_generator_;
+  // Empty: no trace. The trace does not change the run.
+  TraceSink trace_;
 };
 
 struct Result

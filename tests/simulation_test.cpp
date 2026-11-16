@@ -1,11 +1,15 @@
 #include "vsr/checksum.hpp"
 #include "vsr/sim/simulation.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <gtest/gtest.h>
 #include <memory>
 #include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
 // Each test runs the production replica code in the simulator for a range of
 // seeds. A run fails if two replicas disagree, if a client sees a wrong or
@@ -245,6 +249,42 @@ TEST(Simulation, SubmitPath)
   EXPECT_TRUE(messages_only.ok_) << messages_only.failure_;
   EXPECT_EQ(messages_only.submits_accepted_, 0U);
   EXPECT_GT(messages_only.requests_completed_, 0U);
+}
+
+// The trace is a function of the seed: two runs give the same lines. It
+// shows the events of the run, and it does not change the run.
+TEST(Simulation, TraceIsDeterministic)
+{
+  Options options;
+  options.seed_ = 7;
+  const Result without_trace = sim::Run(options);
+
+  std::array<std::vector<std::string>, 2> traces;
+  std::array<Result, 2> results;
+  for (std::size_t run = 0; run < traces.size(); ++run)
+  {
+    options.trace_ = [&lines = traces[run]](std::string_view p_line)
+    { lines.emplace_back(p_line); };
+    results[run] = sim::Run(options);
+  }
+  EXPECT_EQ(traces[0], traces[1]);
+  EXPECT_EQ(results[0].committed_ops_, without_trace.committed_ops_);
+  EXPECT_EQ(results[0].crashes_, without_trace.crashes_);
+
+  const auto count = [&traces](std::string_view p_event)
+  {
+    return static_cast<std::uint64_t>(
+        std::ranges::count_if(traces[0], [p_event](const std::string &p_line)
+                              { return p_line.find(p_event) != std::string::npos; }));
+  };
+  ASSERT_GT(results[0].crashes_, 0U);
+  EXPECT_EQ(count(" crash "), results[0].crashes_);
+  // Each replica starts one time, and one more time after each crash.
+  EXPECT_EQ(count(" start "), results[0].crashes_ + options.replica_count_);
+  EXPECT_EQ(count(" is complete "), results[0].requests_completed_);
+  EXPECT_GT(count(" deliver "), 0U);
+  EXPECT_GT(count(" drop "), 0U);
+  EXPECT_GT(count(" state "), 0U);
 }
 
 // Without faults, each request commits, and no view change is necessary

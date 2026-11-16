@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -41,6 +42,12 @@ constexpr std::size_t kHashReplyBytes = 2 * sizeof(std::uint64_t);
 // The simulator writes the last executed operation before the snapshot of
 // the application.
 constexpr std::size_t kSnapshotHeaderBytes = sizeof(std::uint64_t);
+
+constexpr std::array<std::string_view, kCommandCount> kCommandNames{
+    "Reserved",        "Request",         "Prepare",      "PrepareOk", "Reply",
+    "Commit",          "StartViewChange", "DoViewChange", "StartView", "RequestPrepare",
+    "RequestSnapshot", "Snapshot",        "Eviction"};
+constexpr std::array<std::string_view, 4> kStatusNames{"Normal", "ViewChange", "Joining", "Halted"};
 
 class Random final
 {
@@ -537,6 +544,38 @@ struct PacketLater
   }
 };
 
+// One trace line for a packet.
+[[nodiscard]] std::string Describe(const Packet &p_packet)
+{
+  VSR_ASSERT(p_packet.bytes_.size() >= kHeaderBytes);
+  Header header;
+  std::memcpy(&header, p_packet.bytes_.data(), kHeaderBytes);
+  const std::size_t command = std::to_underlying(header.command_);
+  const std::string_view name = command < kCommandNames.size() ? kCommandNames[command] : "Unknown";
+  if (p_packet.to_client_)
+  {
+    return std::format("{} to client {} request {} op {} view {}", name, p_packet.target_,
+                       header.request_, header.op_, header.view_);
+  }
+  if (header.command_ == Command::Request)
+  {
+    return std::format("{} client {} request {} to replica {}{}",
+                       p_packet.submit_ ? "Submit" : "Request", header.client_, header.request_,
+                       p_packet.target_, p_packet.forwarded_ ? " (sent on)" : "");
+  }
+  std::uint64_t op = header.op_;
+  if (header.command_ == Command::Prepare &&
+      p_packet.bytes_.size() >= kHeaderBytes + kEntryHeaderBytes)
+  {
+    // The operation number of a Prepare is in the log entry.
+    EntryHeader entry;
+    std::memcpy(&entry, p_packet.bytes_.data() + kHeaderBytes, kEntryHeaderBytes);
+    op = entry.op_;
+  }
+  return std::format("{} {}->{} view {} op {} commit {}", name, p_packet.source_replica_,
+                     p_packet.target_, header.view_, op, header.commit_);
+}
+
 struct Client
 {
   std::uint64_t id_ = 0;
@@ -581,6 +620,10 @@ struct Node
   std::optional<Replica> replica_;
   std::uint64_t restart_tick_ = 0;
   std::uint64_t clock_skew_ns_ = 0;
+  // The state in the last trace line of this replica.
+  std::uint32_t traced_view_ = 0;
+  Status traced_status_ = Status::Halted;
+  std::uint64_t traced_commit_ = 0;
   bool isolated_ = false;
 };
 
@@ -644,7 +687,12 @@ public:
     {
       CheckLiveness();
     }
-    return MakeResult();
+    Result result = MakeResult();
+    if (!result.ok_)
+    {
+      Trace("FAIL {}", result.failure_);
+    }
+    return result;
   }
 
   void SendToReplica(std::uint8_t p_source, std::uint8_t p_target,
@@ -668,6 +716,49 @@ public:
   }
 
 private:
+  template <typename... TArgs> void Trace(std::format_string<TArgs...> p_format, TArgs &&...p_args)
+  {
+    if (options_.trace_)
+    {
+      options_.trace_(
+          std::format("{:>6} {}", tick_, std::format(p_format, std::forward<TArgs>(p_args)...)));
+    }
+  }
+
+  // The same, for a line that is expensive to make.
+  void TracePacket(std::string_view p_event, const Packet &p_packet)
+  {
+    if (options_.trace_)
+    {
+      Trace("{} {}", p_event, Describe(p_packet));
+    }
+  }
+
+  // Writes the state of a replica if the view, the status, or the last
+  // executed operation changed.
+  void TraceState(std::size_t p_replica)
+  {
+    auto &node = *nodes_[p_replica];
+    if (!options_.trace_ || !node.replica_)
+    {
+      return;
+    }
+    const Replica &replica = *node.replica_;
+    const bool changed = node.traced_view_ != replica.View() ||
+                         node.traced_status_ != replica.GetStatus() ||
+                         node.traced_commit_ != replica.CommitMin();
+    if (!changed)
+    {
+      return;
+    }
+    node.traced_view_ = replica.View();
+    node.traced_status_ = replica.GetStatus();
+    node.traced_commit_ = replica.CommitMin();
+    Trace("state   replica {} view {} status {}{} log head {} executed {}", p_replica,
+          replica.View(), kStatusNames[std::to_underlying(replica.GetStatus())],
+          replica.IsPrimary() ? " primary" : "", replica.Op(), replica.CommitMin());
+  }
+
   // A PrepareOk and a DoViewChange promise that the sender holds the log up
   // to an operation. The promise is false after a power loss if one of
   // these entries is not yet synced.
@@ -745,6 +836,7 @@ private:
   {
     if (chaos_ && random_.Chance(options_.drop_rate_))
     {
+      TracePacket("drop   ", p_packet);
       return;
     }
     const std::uint32_t delay_max = chaos_ ? options_.delay_ticks_max_ : 1;
@@ -754,10 +846,12 @@ private:
       Packet copy = p_packet;
       copy.deliver_tick_ = tick_ + 1 + random_.Below(delay_max);
       copy.sequence_ = sequence_next_++;
+      TracePacket("repeat ", copy);
       packets_.push(std::move(copy));
     }
     p_packet.deliver_tick_ = tick_ + 1 + random_.Below(delay_max);
     p_packet.sequence_ = sequence_next_++;
+    TracePacket("send   ", p_packet);
     packets_.push(std::move(p_packet));
   }
 
@@ -766,6 +860,7 @@ private:
     auto &node = *nodes_[p_replica];
     node.state_machine_ = std::make_unique<CheckedStateMachine>(&checker_, p_replica, &factory_);
     const Config config = SimulationConfig(options_, static_cast<std::uint8_t>(p_replica));
+    Trace("start   replica {}", p_replica);
     auto replica = Replica::Open(config, node.storage_, node.bus_, *node.state_machine_);
     if (!replica)
     {
@@ -775,12 +870,15 @@ private:
     }
     node.replica_.emplace(std::move(*replica));
     node.restart_tick_ = 0;
+    node.traced_status_ = Status::Halted;
+    TraceState(p_replica);
   }
 
   void Crash(std::size_t p_replica)
   {
     auto &node = *nodes_[p_replica];
     VSR_ASSERT(node.replica_.has_value());
+    Trace("crash   replica {}", p_replica);
     Collect(*node.replica_);
     node.replica_.reset();
     node.state_machine_.reset();
@@ -803,6 +901,7 @@ private:
   void CheckNode(std::size_t p_replica)
   {
     CheckCommittedOpsAreDurable();
+    TraceState(p_replica);
     auto &node = *nodes_[p_replica];
     if (!node.replica_ || node.replica_->GetStatus() != Status::Halted)
     {
@@ -834,8 +933,9 @@ private:
       }
       else if (random_.Chance(options_.storage_fault_rate_))
       {
-        node.storage_.InjectFault(1 +
-                                  static_cast<std::uint32_t>(random_.Below(kStorageFaultOpsMax)));
+        const auto operations = 1 + static_cast<std::uint32_t>(random_.Below(kStorageFaultOpsMax));
+        Trace("fault   replica {} storage fails at operation {} from now", replica, operations);
+        node.storage_.InjectFault(operations);
       }
     }
     if (random_.Chance(options_.partition_rate_))
@@ -848,13 +948,20 @@ private:
       }
       if (!any_isolated)
       {
-        nodes_[random_.Below(nodes_.size())]->isolated_ = true;
+        const std::uint64_t isolated = random_.Below(nodes_.size());
+        nodes_[isolated]->isolated_ = true;
+        Trace("fault   partition: replica {} is isolated", isolated);
+      }
+      else
+      {
+        Trace("fault   partition ends");
       }
     }
   }
 
   void Heal()
   {
+    Trace("heal    the faults stop");
     for (auto &node : nodes_)
     {
       node->isolated_ = false;
@@ -892,8 +999,10 @@ private:
       const bool link_down = node.isolated_ || nodes_[packet.source_replica_]->isolated_;
       if (!node.replica_ || (link_down && packet.source_replica_ != packet.target_))
       {
+        TracePacket(node.replica_ ? "cut    " : "lost   ", packet);
         continue;
       }
+      TracePacket("deliver", packet);
       if (packet.submit_)
       {
         SubmitRequest(packet);
@@ -945,6 +1054,8 @@ private:
                                 replica.Op()));
     }
     submits_accepted_ += result == SubmitResult::Accepted ? 1U : 0U;
+    Trace("submit  replica {} client {} request {} result {}", p_packet.target_, header.client_,
+          header.request_, std::to_underlying(result));
     const bool view_is_open =
         replica.GetStatus() == Status::Normal || replica.GetStatus() == Status::Joining;
     if (result == SubmitResult::NotPrimary && view_is_open && !p_packet.forwarded_)
@@ -1042,10 +1153,12 @@ private:
     p_client.waiting_ = false;
     p_client.next_send_tick_ = tick_ + random_.Below(kClientThinkTicksMax);
     evictions_ += 1;
+    Trace("client  {} has a new identifier after an eviction", p_client.id_);
   }
 
   void OnClientPacket(const Packet &p_packet)
   {
+    TracePacket("deliver", p_packet);
     const auto message = DecodeMessage(p_packet.bytes_);
     const bool known_command =
         message.has_value() && (message->header_.command_ == Command::Reply ||
@@ -1091,6 +1204,7 @@ private:
     client.view_hint_ = std::max(client.view_hint_, header.view_);
     client.next_send_tick_ = tick_ + random_.Below(kClientThinkTicksMax);
     requests_completed_ += 1;
+    Trace("client  {} request {} is complete at op {}", client.id_, client.request_, header.op_);
   }
 
   [[nodiscard]] bool CheckReply(const Client &p_client, const Message &p_message)
