@@ -100,7 +100,12 @@ is the regression set. The fresh set is 200 seeds that start at a value
 from the commit SHA, `GITHUB_RUN_ID`, and `GITHUB_RUN_ATTEMPT`. Each run
 and each rerun gets new seeds. The log shows each range on a `SEEDS` line.
 A failure prints a `REPLAY` line with the command to replay the failed
-seed. A failed fresh seed is a real defect: add it to the tests. A separate job fuzzes the instrumented decoder for 60 seconds.
+seed. An assertion abort or a sanitizer stop prints no `FAIL` line, so the
+script runs the range again one seed at a time to find the seed. If no
+single seed fails, the `REPLAY` line gives the whole range.
+`tools/test_sim_seeds.sh` tests this with fake simulators. A failed fresh
+seed is a real defect: add it to the tests. A separate job fuzzes the
+instrumented decoder for 60 seconds.
 Each job keeps its source mount read-only and builds in a disposable
 container. Build logs, package versions, and CTest logs are CI artifacts.
 

@@ -10,7 +10,8 @@ derive_first_seed() {
 }
 
 # run_seeds <simulator> <first seed> <seed count> <replicas> [simulator options]
-# Print the range and the result. On failure, print the command to replay it.
+# Print the range and the result. On failure, print the command to replay the
+# failed seed. If the seed is not known, print the command for the whole range.
 run_seeds() {
   local simulator=$1 first=$2 count=$3 replicas=$4
   shift 4
@@ -21,7 +22,28 @@ run_seeds() {
   if ((status != 0)); then
     local failed
     failed=$(sed -n 's/^FAIL seed=\([0-9]*\).*/\1/p' <<<"$output" | head -n 1)
-    echo "REPLAY failed seed: $simulator ${failed:-$first} 1 $replicas $*" >&2
+    # An assertion abort or a sanitizer stop prints no FAIL line. The run is
+    # deterministic, so run the range again one seed at a time to find the seed.
+    [[ -n $failed ]] || failed=$(find_failed_seed "$simulator" "$first" "$count" "$replicas" "$@")
+    if [[ -n $failed ]]; then
+      echo "REPLAY failed seed: $simulator $failed 1 $replicas $*" >&2
+    else
+      echo "REPLAY failed range, the seed is not known: $simulator $first $count $replicas $*" >&2
+    fi
     return 1
   fi
+}
+
+# find_failed_seed <simulator> <first seed> <seed count> <replicas> [simulator options]
+# Print the first seed that makes the simulator exit with an error.
+# Print nothing if every seed passes alone.
+find_failed_seed() {
+  local simulator=$1 first=$2 count=$3 replicas=$4 seed
+  shift 4
+  for ((seed = first; seed < first + count; ++seed)); do
+    if ! "$simulator" "$seed" 1 "$replicas" "$@" >/dev/null; then
+      echo "$seed"
+      return 0
+    fi
+  done
 }

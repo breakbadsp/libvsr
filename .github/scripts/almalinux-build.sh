@@ -40,6 +40,7 @@ else
   cmake --build --preset "$preset" --parallel 2
   ctest --preset "$preset" --timeout 180
   simulator=./build/$preset/sim/vsr_sim
+  bash /source/tools/test_sim_seeds.sh
   source /source/.github/scripts/sim-seeds.sh
   # Fixed set: the regression seeds. Fresh set: new seeds for each CI run.
   run_seeds "$simulator" 1 300 3
