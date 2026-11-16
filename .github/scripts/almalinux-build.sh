@@ -39,6 +39,14 @@ if [[ $CI_CHECK == fuzz ]]; then
 else
   cmake --build --preset "$preset" --parallel 2
   ctest --preset "$preset" --timeout 180
-  ./build/"$preset"/sim/vsr_sim 1 300 3
-  ./build/"$preset"/sim/vsr_sim 1 300 5
+  simulator=./build/$preset/sim/vsr_sim
+  bash /source/tools/test_sim_seeds.sh
+  source /source/.github/scripts/sim-seeds.sh
+  # Fixed set: the regression seeds. Fresh set: new seeds for each CI run.
+  run_seeds "$simulator" 1 300 3
+  run_seeds "$simulator" 1 300 5
+  fresh=$(derive_first_seed "${CI_SEED_SOURCE:?set CI_SEED_SOURCE}:$CI_CHECK")
+  echo "Fresh seed source: $CI_SEED_SOURCE:$CI_CHECK"
+  run_seeds "$simulator" "$fresh" 200 3
+  run_seeds "$simulator" "$fresh" 200 5
 fi

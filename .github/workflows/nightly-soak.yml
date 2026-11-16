@@ -1,0 +1,60 @@
+name: Nightly soak
+
+on:
+  # A scheduled run uses the default branch only.
+  schedule:
+    - cron: '17 1 * * *'
+  workflow_dispatch:
+    inputs:
+      first_seed:
+        description: First seed, or empty for a new value
+        type: string
+        default: ''
+      seeds_per_shard:
+        description: Seed limit for each shard, or 0 to run until the time budget ends
+        type: string
+        default: '0'
+      budget_minutes:
+        description: Time budget in minutes
+        type: string
+        default: '60'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-soak
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: Mutation check and soak
+    # The runner host has 6 CPUs. This job uses at most 4 of them.
+    runs-on: [self-hosted, Linux, X64, libvsr]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Run in AlmaLinux
+        env:
+          ALMA_VERSION: '8'
+          SOAK_SEED_SOURCE: ${{ github.sha }}:${{ github.run_id }}:${{ github.run_attempt }}
+          SOAK_FIRST_SEED: ${{ inputs.first_seed }}
+          SOAK_SEEDS_PER_SHARD: ${{ inputs.seeds_per_shard || '0' }}
+          SOAK_BUDGET_MINUTES: ${{ inputs.budget_minutes || '60' }}
+        run: |
+          mkdir -p reports
+          git rev-parse HEAD > reports/commit.txt
+          image="$(bash .github/scripts/almalinux-image.sh)"
+          docker run --rm --cap-drop ALL --security-opt no-new-privileges \
+            --cpus 4 \
+            -e SOAK_SEED_SOURCE -e SOAK_FIRST_SEED -e SOAK_SEEDS_PER_SHARD \
+            -e SOAK_BUDGET_MINUTES \
+            -v "$PWD:/source:ro" -v "$PWD/reports:/reports" \
+            "$image" bash /source/.github/scripts/nightly-soak.sh
+      - name: Save logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nightly-soak
+          path: reports/
+          retention-days: 30
