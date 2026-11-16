@@ -78,6 +78,9 @@ std::expected<void, StorageError> Journal::Recover(std::uint64_t p_checkpoint_op
     floor_op_ -= 1;
     floor_checksum_ = header.parent_;
   }
+  VSR_ASSERT(floor_op_ <= p_checkpoint_op);
+  VSR_ASSERT(head_op_ >= p_checkpoint_op);
+  VSR_ASSERT(head_op_ - floor_op_ <= layout_.slot_count_);
   return {};
 }
 
@@ -117,6 +120,8 @@ std::expected<void, StorageError> Journal::Append(const EntryHeader &p_header,
     floor_checksum_ = ChecksumAt(replaced_op);
     floor_op_ = replaced_op;
   }
+  // The ring holds at most one lap: the new entry and the floor fit.
+  VSR_ASSERT(p_header.op_ - floor_op_ <= layout_.slot_count_);
 
   std::memcpy(slot_buffer_.data(), &p_header, kEntryHeaderBytes);
   if (!p_body.empty())
@@ -131,6 +136,8 @@ std::expected<void, StorageError> Journal::Append(const EntryHeader &p_header,
   head_op_ = p_header.op_;
   headers_[head_op_ % layout_.slot_count_] = p_header;
   dirty_ = true;
+  // Read back the new head. The next entry links to this checksum.
+  VSR_ASSERT(HeadChecksum() == p_header.checksum_);
   return {};
 }
 
@@ -161,6 +168,7 @@ std::expected<void, StorageError> Journal::TruncateTo(std::uint64_t p_op)
     return erased;
   }
   head_op_ = p_op;
+  VSR_ASSERT(!dirty_);
   return {};
 }
 
@@ -173,6 +181,7 @@ std::expected<void, StorageError> Journal::Reset(std::uint64_t p_op, std::uint64
   floor_op_ = p_op;
   floor_checksum_ = p_checksum;
   head_op_ = p_op;
+  VSR_ASSERT(!dirty_);
   return {};
 }
 
