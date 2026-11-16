@@ -31,6 +31,7 @@ A host with its own network, storage, or client protocol uses
 
 ## Read
 
+- [Usage guide](docs/usage.md): requirements, limits, and how to adapt an application.
 - [Host contract](docs/host-contract.md): what the application and the host must do.
 - [Design decisions](docs/design-decisions.md): what was selected, why, and the TODO list.
 - [Verification](docs/verification.md): the simulator, its checks, and how to run them.
