@@ -3,6 +3,7 @@ find_package(GTest REQUIRED)
 add_executable(vsr_tests
   checksum_test.cpp
   message_test.cpp
+  client_core_test.cpp
   client_table_test.cpp
   io_test.cpp
   journal_test.cpp

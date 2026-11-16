@@ -1,15 +1,18 @@
 #include "vsr/io/client.hpp"
 
 #include "socket.hpp"
-#include "vsr/message.hpp"
+#include "vsr/client_core.hpp"
 
 #include <algorithm>
 #include <cerrno>
-#include <optional>
+#include <limits>
 #include <poll.h>
 #include <random>
 #include <sys/socket.h>
 #include <utility>
+
+// The protocol of the client is in `vsr::ClientCore`. This file gives the
+// core its sockets and its clock.
 
 namespace vsr::io
 {
@@ -20,15 +23,46 @@ namespace
 constexpr std::uint64_t kNsPerMs = 1'000'000;
 constexpr int kConnectWaitMs = 50;
 
-[[nodiscard]] std::uint64_t RandomClientId()
+[[nodiscard]] std::uint64_t RandomSeed()
 {
   std::random_device device;
-  std::uint64_t id = 0;
-  while (id == 0)
+  return (std::uint64_t{device()} << 32) | device();
+}
+
+// The time at which a wait that starts at `p_now_ns` ends. A timeout that
+// the clock cannot hold gives the largest time, which never comes.
+[[nodiscard]] std::uint64_t DeadlineNs(std::uint64_t p_now_ns,
+                                       std::chrono::milliseconds p_timeout) noexcept
+{
+  const auto timeout_ms = static_cast<std::uint64_t>(std::max<std::int64_t>(p_timeout.count(), 0));
+  if (timeout_ms > (kClientNever - p_now_ns) / kNsPerMs)
   {
-    id = (std::uint64_t{device()} << 32) | device();
+    return kClientNever;
   }
-  return id;
+  return p_now_ns + timeout_ms * kNsPerMs;
+}
+
+// The time until `p_wake_ns` as a `poll` timeout, rounded up.
+[[nodiscard]] int WaitMs(std::uint64_t p_now_ns, std::uint64_t p_wake_ns) noexcept
+{
+  const std::uint64_t wait_ns = p_wake_ns > p_now_ns ? p_wake_ns - p_now_ns : 0;
+  const std::uint64_t wait_ms = wait_ns / kNsPerMs + (wait_ns % kNsPerMs == 0 ? 0 : 1);
+  return static_cast<int>(
+      std::min<std::uint64_t>(wait_ms, std::uint64_t{std::numeric_limits<int>::max()}));
+}
+
+[[nodiscard]] ClientError ToClientError(ClientCoreError p_error) noexcept
+{
+  switch (p_error)
+  {
+  case ClientCoreError::TooLarge:
+    return ClientError::TooLarge;
+  case ClientCoreError::Pending:
+    return ClientError::Pending;
+  case ClientCoreError::NotPending:
+    return ClientError::NotPending;
+  }
+  return ClientError::NotPending;
 }
 
 } // namespace
@@ -36,42 +70,38 @@ constexpr int kConnectWaitMs = 50;
 class Client::Impl final
 {
 public:
-  Impl(ClientOptions p_options, std::vector<sockaddr_in> p_addresses)
-      : options_(std::move(p_options)), addresses_(std::move(p_addresses)),
-        sockets_(addresses_.size())
+  Impl(const ClientCoreOptions &p_options, std::vector<sockaddr_in> p_addresses)
+      : core_(p_options), addresses_(std::move(p_addresses)), sockets_(addresses_.size()),
+        waiters_(addresses_.size()), send_wait_ns_(p_options.retry_interval_)
   {
     for (std::size_t index = 0; index < addresses_.size(); ++index)
     {
-      buffers_.emplace_back(options_.body_bytes_max_);
+      buffers_.emplace_back(p_options.body_bytes_max_);
     }
   }
 
-  [[nodiscard]] std::uint64_t Id() const noexcept { return options_.client_; }
+  [[nodiscard]] std::uint64_t Id() const noexcept { return core_.Id(); }
 
   [[nodiscard]] std::expected<std::vector<std::byte>, ClientError>
   Request(std::span<const std::byte> p_body, std::chrono::milliseconds p_timeout)
   {
-    if (pending_)
+    const auto started = core_.Request(p_body, DeadlineNs(internal::MonotonicNs(), p_timeout));
+    if (!started)
     {
-      return std::unexpected(ClientError::Pending);
+      return std::unexpected(ToClientError(started.error()));
     }
-    if (p_body.size() > options_.body_bytes_max_)
-    {
-      return std::unexpected(ClientError::TooLarge);
-    }
-    body_.assign(p_body.begin(), p_body.end());
-    pending_ = true;
-    return Wait(p_timeout);
+    return Wait();
   }
 
   [[nodiscard]] std::expected<std::vector<std::byte>, ClientError>
   Resume(std::chrono::milliseconds p_timeout)
   {
-    if (!pending_)
+    const auto started = core_.Resume(DeadlineNs(internal::MonotonicNs(), p_timeout));
+    if (!started)
     {
-      return std::unexpected(ClientError::NotPending);
+      return std::unexpected(ToClientError(started.error()));
     }
-    return Wait(p_timeout);
+    return Wait();
   }
 
 private:
@@ -99,7 +129,7 @@ private:
     return true;
   }
 
-  void Send(std::size_t p_replica)
+  void Send(std::size_t p_replica, std::span<const std::byte> p_message)
   {
     if (!EnsureConnected(p_replica))
     {
@@ -107,12 +137,12 @@ private:
     }
     // The socket does not block, so a large request can need several
     // sends. Wait for the socket at most one retry interval.
-    const std::uint64_t deadline_ns = internal::MonotonicNs() + options_.retry_ms_ * kNsPerMs;
+    const std::uint64_t deadline_ns = internal::MonotonicNs() + send_wait_ns_;
     std::size_t sent_bytes = 0;
-    while (sent_bytes < message_.size())
+    while (sent_bytes < p_message.size())
     {
-      const ssize_t count = ::send(sockets_[p_replica].Get(), message_.data() + sent_bytes,
-                                   message_.size() - sent_bytes, MSG_NOSIGNAL);
+      const ssize_t count = ::send(sockets_[p_replica].Get(), p_message.data() + sent_bytes,
+                                   p_message.size() - sent_bytes, MSG_NOSIGNAL);
       if (count > 0)
       {
         sent_bytes += static_cast<std::size_t>(count);
@@ -131,200 +161,97 @@ private:
     }
   }
 
-  void Encode(std::uint64_t p_request, std::span<const std::byte> p_body)
+  // Reads one socket and gives its messages to the core. Puts the body in
+  // `reply_` if the reply to the request in progress arrived.
+  [[nodiscard]] ClientEventKind Receive(std::size_t p_replica)
   {
-    Header header;
-    header.command_ = Command::Request;
-    header.cluster_ = options_.cluster_;
-    header.client_ = options_.client_;
-    header.request_ = p_request;
-    header.session_ = p_request == 0 ? 0 : session_;
-    message_.resize(kHeaderBytes + p_body.size());
-    message_.resize(EncodeMessage(header, p_body, {}, message_));
-    message_request_ = p_request;
-    primary_only_ = true;
-    next_send_ns_ = 0;
-  }
-
-  enum class Received
-  {
-    Nothing = 0,
-    Reply,
-    Eviction,
-  };
-
-  // Reads one socket. Puts the body in `reply_` if the reply to the message
-  // in progress arrived.
-  [[nodiscard]] Received Receive(std::size_t p_replica)
-  {
-    Received received = Received::Nothing;
+    ClientEventKind kind = ClientEventKind::None;
     const auto result = buffers_[p_replica].ReadFrom(sockets_[p_replica].Get());
     const bool valid = buffers_[p_replica].Drain(
-        [this, &received](std::span<const std::byte> p_bytes)
+        [this, &kind](std::span<const std::byte> p_bytes)
         {
-          const auto message = DecodeMessage(p_bytes);
-          const bool for_this_client = message.has_value() &&
-                                       message->header_.cluster_ == options_.cluster_ &&
-                                       message->header_.client_ == options_.client_;
-          if (!for_this_client || received != Received::Nothing)
+          if (kind != ClientEventKind::None)
           {
             return;
           }
-          const Header &header = message->header_;
-          if (header.command_ == Command::Reply && header.request_ == message_request_ &&
-              (message_request_ == 0 || header.session_ == session_))
+          const ClientEvent event = core_.OnMessage(p_bytes);
+          kind = event.kind_;
+          if (kind == ClientEventKind::Reply)
           {
-            if (message_request_ == 0)
-            {
-              session_ = header.session_;
-            }
-            view_ = std::max(view_, header.view_);
-            reply_.assign(message->body_.begin(), message->body_.end());
-            received = Received::Reply;
-          }
-          // A replica that is behind does not know a new session. Its
-          // notice has an older view than a reply that this client has seen.
-          else if (header.command_ == Command::Eviction && header.view_ >= view_)
-          {
-            received = Received::Eviction;
+            // The reply refers to the buffer, which the next read changes.
+            reply_.assign(event.reply_.begin(), event.reply_.end());
           }
         });
     if (result == internal::ReadResult::Closed || !valid)
     {
       sockets_[p_replica].Reset();
     }
-    return received;
+    return kind;
   }
 
-  [[nodiscard]] std::expected<std::vector<std::byte>, ClientError>
-  Wait(std::chrono::milliseconds p_timeout)
+  // Waits for the open sockets until `p_wake_ns`, then reads those that
+  // have data.
+  [[nodiscard]] ClientEventKind ReceiveUntil(std::uint64_t p_wake_ns)
   {
-    const std::uint64_t deadline_ns =
-        internal::MonotonicNs() +
-        static_cast<std::uint64_t>(std::max<std::int64_t>(p_timeout.count(), 0)) * kNsPerMs;
-    // Two steps at most: the registration, then the operation.
+    for (std::size_t replica = 0; replica < sockets_.size(); ++replica)
+    {
+      // `poll` ignores a negative descriptor.
+      waiters_[replica] =
+          pollfd{sockets_[replica].IsOpen() ? sockets_[replica].Get() : -1, POLLIN, 0};
+    }
+    const int ready_count =
+        ::poll(waiters_.data(), waiters_.size(), WaitMs(internal::MonotonicNs(), p_wake_ns));
+    for (std::size_t replica = 0; ready_count > 0 && replica < waiters_.size(); ++replica)
+    {
+      if (waiters_[replica].revents == 0)
+      {
+        continue;
+      }
+      const ClientEventKind kind = Receive(replica);
+      if (kind != ClientEventKind::None)
+      {
+        return kind;
+      }
+    }
+    return ClientEventKind::None;
+  }
+
+  // Runs the core until the request in progress has its result, or the
+  // deadline of the wait passes.
+  [[nodiscard]] std::expected<std::vector<std::byte>, ClientError> Wait()
+  {
     while (true)
     {
-      // Encode a message once: `Resume` continues the message in progress.
-      if (!registered_)
+      const ClientSend send = core_.Poll(internal::MonotonicNs());
+      for (std::size_t replica = send.replica_begin_; replica < send.replica_end_; ++replica)
       {
-        if (message_request_ != 0)
-        {
-          Encode(0, {});
-        }
+        // The primary replies on the connection that carried the request.
+        Send(replica, send.message_);
       }
-      else if (message_request_ != request_ + 1)
+      const ClientEventKind kind = ReceiveUntil(core_.WakeTime());
+      if (kind == ClientEventKind::Reply)
       {
-        Encode(request_ + 1, body_);
+        return std::move(reply_);
       }
-      const Received received = Exchange(deadline_ns);
-      if (received == Received::Nothing)
+      if (kind == ClientEventKind::Evicted)
+      {
+        return std::unexpected(ClientError::Evicted);
+      }
+      if (core_.Expire(internal::MonotonicNs()))
       {
         return std::unexpected(ClientError::Timeout);
       }
-      if (received == Received::Eviction)
-      {
-        // The cluster has no record of this client any more, so the same
-        // request could execute twice. Start a new session.
-        options_.client_ = RandomClientId();
-        registered_ = false;
-        request_ = 0;
-        message_request_ = kNoRequest;
-        pending_ = false;
-        return std::unexpected(ClientError::Evicted);
-      }
-      if (!registered_)
-      {
-        registered_ = true;
-        continue;
-      }
-      request_ += 1;
-      pending_ = false;
-      return std::move(reply_);
     }
   }
 
-  // Sends `message_` until its reply or an eviction notice arrives, or the
-  // deadline passes.
-  [[nodiscard]] Received Exchange(std::uint64_t p_deadline_ns)
-  {
-    while (true)
-    {
-      std::uint64_t now_ns = internal::MonotonicNs();
-      if (now_ns >= next_send_ns_)
-      {
-        // The primary alone at first. If it does not answer, every replica:
-        // the primary can be a different one now, and it replies on the
-        // connection that carried the request. This state belongs to the
-        // message, not to the call: a caller with a timeout shorter than the
-        // retry interval must also reach every replica.
-        for (std::size_t replica = 0; replica < addresses_.size(); ++replica)
-        {
-          if (!primary_only_ || replica == view_ % addresses_.size())
-          {
-            Send(replica);
-          }
-        }
-        primary_only_ = false;
-        next_send_ns_ = now_ns + options_.retry_ms_ * kNsPerMs;
-      }
-      std::vector<pollfd> waiters;
-      std::vector<std::size_t> replicas;
-      for (std::size_t replica = 0; replica < sockets_.size(); ++replica)
-      {
-        if (sockets_[replica].IsOpen())
-        {
-          waiters.push_back(pollfd{sockets_[replica].Get(), POLLIN, 0});
-          replicas.push_back(replica);
-        }
-      }
-      now_ns = internal::MonotonicNs();
-      const std::uint64_t wake_ns = std::min(p_deadline_ns, next_send_ns_);
-      const std::uint64_t wait_ns = wake_ns > now_ns ? wake_ns - now_ns : 0;
-      const int wait_ms = static_cast<int>((wait_ns + kNsPerMs - 1) / kNsPerMs);
-      const int ready_count = ::poll(waiters.data(), waiters.size(), wait_ms);
-      for (std::size_t index = 0; ready_count > 0 && index < waiters.size(); ++index)
-      {
-        if (waiters[index].revents == 0)
-        {
-          continue;
-        }
-        const Received received = Receive(replicas[index]);
-        if (received != Received::Nothing)
-        {
-          return received;
-        }
-      }
-      if (internal::MonotonicNs() >= p_deadline_ns)
-      {
-        return Received::Nothing;
-      }
-    }
-  }
-
-  ClientOptions options_;
+  ClientCore core_;
   std::vector<sockaddr_in> addresses_;
   std::vector<UniqueFd> sockets_;
   std::vector<internal::FrameBuffer> buffers_;
-  static constexpr std::uint64_t kNoRequest = ~std::uint64_t{0};
-
-  // The operation that waits for its reply.
-  std::vector<std::byte> body_;
-  // The encoded message in progress, and its request number.
-  std::vector<std::byte> message_;
-  std::uint64_t message_request_ = kNoRequest;
-  // The message in progress went to the supposed primary only, or not yet.
-  bool primary_only_ = true;
-  // When to send the message in progress again. 0: now.
-  std::uint64_t next_send_ns_ = 0;
+  // One entry for each replica, for `poll`.
+  std::vector<pollfd> waiters_;
+  std::uint64_t send_wait_ns_;
   std::vector<std::byte> reply_;
-  // The last request number that got its reply.
-  std::uint64_t request_ = 0;
-  // The highest view in a reply. The primary of that view gets requests first.
-  std::uint32_t view_ = 0;
-  std::uint64_t session_ = 0;
-  bool registered_ = false;
-  bool pending_ = false;
 };
 
 Client::Client(std::unique_ptr<Impl> p_impl) noexcept : impl_(std::move(p_impl)) {}
@@ -339,6 +266,10 @@ std::expected<Client, std::string> Client::Create(ClientOptions p_options)
   {
     return std::unexpected(std::string{"at least one replica address is necessary"});
   }
+  if (p_options.addresses_.size() > std::numeric_limits<std::uint8_t>::max())
+  {
+    return std::unexpected(std::string{"too many replica addresses"});
+  }
   std::vector<sockaddr_in> addresses;
   for (const auto &text : p_options.addresses_)
   {
@@ -349,11 +280,14 @@ std::expected<Client, std::string> Client::Create(ClientOptions p_options)
     }
     addresses.push_back(*address);
   }
-  if (p_options.client_ == 0)
-  {
-    p_options.client_ = RandomClientId();
-  }
-  return Client{std::make_unique<Impl>(std::move(p_options), std::move(addresses))};
+  ClientCoreOptions core_options;
+  core_options.cluster_ = p_options.cluster_;
+  core_options.client_ = p_options.client_;
+  core_options.seed_ = RandomSeed();
+  core_options.replica_count_ = static_cast<std::uint8_t>(addresses.size());
+  core_options.body_bytes_max_ = p_options.body_bytes_max_;
+  core_options.retry_interval_ = p_options.retry_ms_ * kNsPerMs;
+  return Client{std::make_unique<Impl>(core_options, std::move(addresses))};
 }
 
 std::expected<std::vector<std::byte>, ClientError>
