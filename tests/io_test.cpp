@@ -298,6 +298,15 @@ TEST_F(Cluster, ServesRequests)
   }
 }
 
+// A caller that has no time limit gives the largest duration. The client
+// must wait for the reply, not report a timeout at once.
+TEST_F(Cluster, WaitsWithTheLargestTimeout)
+{
+  Client client = MakeClient();
+  const auto reply = client.Request(Bytes("key=value"), std::chrono::milliseconds::max());
+  EXPECT_TRUE(reply.has_value());
+}
+
 // A request body of the largest size goes through the network and the log.
 TEST_F(Cluster, ServesLargestBody)
 {
