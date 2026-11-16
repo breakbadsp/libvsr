@@ -223,6 +223,30 @@ TEST(Simulation, HostApplicationLimits)
   EXPECT_TRUE(sim::Run(options).ok_);
 }
 
+// A host with its own client protocol calls `Replica::Submit` for each
+// request. The cluster serves the clients through this path only, with the
+// same checks, and also with no `Submit` call.
+TEST(Simulation, SubmitPath)
+{
+  Options options;
+  options.submit_rate_ = 10'000;
+  for (std::uint64_t seed = 1; seed <= 40; ++seed)
+  {
+    options.seed_ = seed;
+    const Result result = sim::Run(options);
+    ASSERT_TRUE(result.ok_) << "seed " << seed << ": " << result.failure_;
+    // A request can be in the log more than once after a view change.
+    EXPECT_GE(result.submits_accepted_, result.requests_completed_);
+    EXPECT_GT(result.requests_completed_, 0U);
+  }
+  options.submit_rate_ = 0;
+  options.seed_ = 1;
+  const Result messages_only = sim::Run(options);
+  EXPECT_TRUE(messages_only.ok_) << messages_only.failure_;
+  EXPECT_EQ(messages_only.submits_accepted_, 0U);
+  EXPECT_GT(messages_only.requests_completed_, 0U);
+}
+
 // Without faults, each request commits, and no view change is necessary
 // after the first primary is elected.
 TEST(Simulation, NoFaultsThreeReplicas)

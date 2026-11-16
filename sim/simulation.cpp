@@ -519,6 +519,10 @@ struct Packet
   std::uint64_t deliver_tick_ = 0;
   std::uint64_t sequence_ = 0;
   bool to_client_ = false;
+  // A request that the host gives to `Replica::Submit`.
+  bool submit_ = false;
+  // The host already sent this request on to the primary.
+  bool forwarded_ = false;
   std::uint64_t source_replica_ = 0;
   std::uint64_t target_ = 0;
   std::vector<std::byte> bytes_;
@@ -890,7 +894,14 @@ private:
       {
         continue;
       }
-      node.replica_->OnMessage(packet.bytes_);
+      if (packet.submit_)
+      {
+        SubmitRequest(packet);
+      }
+      else
+      {
+        node.replica_->OnMessage(packet.bytes_);
+      }
       // A host can flush after one message or after several. The power can
       // fail before the flush.
       if (!chaos_ || random_.Below(4) != 0)
@@ -903,6 +914,46 @@ private:
         continue;
       }
       CheckNode(packet.target_);
+    }
+  }
+
+  // The path of a host with its own client protocol: the host decodes the
+  // request and calls `Submit`. A host that is not the primary sends the
+  // request on to the primary one time, as a replica does for a `Request`.
+  void SubmitRequest(const Packet &p_packet)
+  {
+    Replica &replica = *nodes_[p_packet.target_]->replica_;
+    const auto message = DecodeMessage(p_packet.bytes_);
+    VSR_ASSERT(message.has_value());
+    const Header &header = message->header_;
+    const bool was_primary = replica.IsPrimary();
+    const std::uint64_t head_before = replica.Op();
+    const SubmitResult result =
+        replica.Submit(header.client_, header.request_, header.session_, message->body_);
+    const bool appended = replica.Op() == head_before + 1;
+    // A valid request is `Invalid` only when the storage fails.
+    const bool consistent = result == SubmitResult::Invalid
+                                ? replica.GetStatus() == Status::Halted
+                                : (result == SubmitResult::NotPrimary) != was_primary &&
+                                      (result == SubmitResult::Accepted) == appended;
+    if (!consistent)
+    {
+      checker_.Fail(std::format("replica {}: Submit of client {} request {} gave result {}, "
+                                "primary {}, log head {} then {}",
+                                p_packet.target_, header.client_, header.request_,
+                                std::to_underlying(result), was_primary, head_before,
+                                replica.Op()));
+    }
+    submits_accepted_ += result == SubmitResult::Accepted ? 1U : 0U;
+    const bool view_is_open =
+        replica.GetStatus() == Status::Normal || replica.GetStatus() == Status::Joining;
+    if (result == SubmitResult::NotPrimary && view_is_open && !p_packet.forwarded_)
+    {
+      Packet forward = p_packet;
+      forward.forwarded_ = true;
+      forward.source_replica_ = replica.PrimaryIndex();
+      forward.target_ = replica.PrimaryIndex();
+      Enqueue(std::move(forward));
     }
   }
 
@@ -921,6 +972,7 @@ private:
     // state of the target decides the delivery.
     packet.source_replica_ = p_replica;
     packet.target_ = p_replica;
+    packet.submit_ = random_.Chance(options_.submit_rate_);
     packet.bytes_.assign(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(message_bytes));
     Enqueue(std::move(packet));
     p_client.retry_tick_ = tick_ + kClientRetryTicks;
@@ -1159,6 +1211,7 @@ private:
     result.committed_ops_ = checker_.ExecutedCount();
     result.evictions_ = evictions_;
     result.requests_completed_ = requests_completed_;
+    result.submits_accepted_ = submits_accepted_;
     result.crashes_ = crashes_;
     result.view_max_ = view_max_;
     result.checkpoints_ = checkpoints_;
@@ -1183,6 +1236,7 @@ private:
   std::unordered_map<std::uint64_t, std::size_t> client_indexes_;
   bool chaos_ = false;
   std::uint64_t requests_completed_ = 0;
+  std::uint64_t submits_accepted_ = 0;
   std::uint64_t crashes_ = 0;
   std::uint64_t view_max_ = 0;
   std::uint64_t checkpoints_ = 0;

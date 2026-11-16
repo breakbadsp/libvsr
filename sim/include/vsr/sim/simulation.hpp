@@ -86,6 +86,10 @@ struct Options
   std::uint32_t storage_fault_rate_ = 10;
   std::uint32_t partition_rate_ = 20;
   std::uint32_t delay_ticks_max_ = 8;
+  // The share of the client sends that reach the replica through
+  // `Replica::Submit`, the path of a host with its own client protocol. The
+  // other sends are `Request` messages for `Replica::OnMessage`.
+  std::uint32_t submit_rate_ = 3000;
   // Wall clocks of replicas differ by up to this value.
   std::uint64_t clock_skew_ns_max_ = 50'000'000;
 
@@ -108,6 +112,8 @@ struct Result
   // than the client table holds.
   std::uint64_t evictions_ = 0;
   std::uint64_t requests_completed_ = 0;
+  // Requests that `Replica::Submit` put in the log.
+  std::uint64_t submits_accepted_ = 0;
   std::uint64_t crashes_ = 0;
   std::uint64_t view_max_ = 0;
   std::uint64_t checkpoints_ = 0;
