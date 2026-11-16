@@ -81,7 +81,9 @@ loop:
   that the client already has. A replica that is behind does not know new
   sessions.
 
-`vsr::io::Client` does all of this.
+`vsr::ClientCore` (`include/vsr/client_core.hpp`) does all of this, without
+input and output. `vsr::io::Client` gives it sockets and a clock. A host
+with its own network can run the core directly.
 
 ## Limits
 

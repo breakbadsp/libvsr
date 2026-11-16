@@ -24,6 +24,7 @@ endif()
 
 add_library(vsr
   src/checksum.cpp
+  src/client_core.cpp
   src/client_table.cpp
   src/config.cpp
   src/journal.cpp
