@@ -8,7 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(VSR_ENABLE_ASAN "Build with AddressSanitizer" OFF)
 option(VSR_ENABLE_UBSAN "Build with UndefinedBehaviorSanitizer" OFF)
-option(VSR_BUILD_TESTS "Build the tests and the simulator" ON)
+option(VSR_BUILD_TESTS "Build the tests" ON)
 
 add_library(vsr_options INTERFACE)
 target_compile_options(vsr_options INTERFACE
@@ -52,8 +52,15 @@ if(VSR_BUILD_FUZZ)
   add_subdirectory(fuzz)
 endif()
 
+# The simulator library `vsr_sim_lib` runs a host application in the
+# simulator. A project that adds libvsr with `add_subdirectory` can link it
+# without the tests.
+option(VSR_BUILD_SIM "Build the simulator library and the simulator" ON)
+if(VSR_BUILD_SIM OR VSR_BUILD_TESTS)
+  add_subdirectory(sim)
+endif()
+
 if(VSR_BUILD_TESTS)
   enable_testing()
-  add_subdirectory(sim)
   add_subdirectory(tests)
 endif()

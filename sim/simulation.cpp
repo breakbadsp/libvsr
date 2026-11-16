@@ -1,4 +1,4 @@
-#include "simulation.hpp"
+#include "vsr/sim/simulation.hpp"
 
 #include "vsr/assert.hpp"
 #include "vsr/checksum.hpp"
@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -33,10 +34,20 @@ constexpr std::uint64_t kRestartDelayTicksMax = 300;
 constexpr std::uint32_t kStorageFaultOpsMax = 6;
 // A crash before a flush is the case that loses writes, so make it frequent.
 constexpr std::uint32_t kUnflushedCrashFactor = 5;
-// Larger than one message body, so that a snapshot needs several chunks.
-constexpr std::size_t kSnapshotPaddingBytes = 600;
-constexpr std::size_t kSnapshotBytes = 2 * sizeof(std::uint64_t) + kSnapshotPaddingBytes;
-constexpr std::size_t kReplyBytes = 2 * sizeof(std::uint64_t);
+// Larger than one default message body, so that a snapshot needs several
+// chunks.
+constexpr std::size_t kHashSnapshotPaddingBytes = 600;
+constexpr std::size_t kHashSnapshotBytes = sizeof(std::uint64_t) + kHashSnapshotPaddingBytes;
+constexpr std::size_t kHashReplyBytes = 2 * sizeof(std::uint64_t);
+// The simulator writes the last executed operation before the snapshot of
+// the application.
+constexpr std::size_t kSnapshotHeaderBytes = sizeof(std::uint64_t);
+
+constexpr std::array<std::string_view, kCommandCount> kCommandNames{
+    "Reserved",        "Request",         "Prepare",      "PrepareOk", "Reply",
+    "Commit",          "StartViewChange", "DoViewChange", "StartView", "RequestPrepare",
+    "RequestSnapshot", "Snapshot",        "Eviction"};
+constexpr std::array<std::string_view, 4> kStatusNames{"Normal", "ViewChange", "Joining", "Halted"};
 
 class Random final
 {
@@ -220,8 +231,9 @@ struct Committed
   std::uint64_t client_ = 0;
   std::uint64_t request_ = 0;
   std::uint64_t timestamp_ns_ = 0;
-  std::uint64_t state_hash_ = 0;
-  std::array<std::byte, kReplyBytes> reply_{};
+  // The digest of the application after the operation.
+  std::uint64_t digest_ = 0;
+  std::uint64_t reply_checksum_ = 0;
 };
 
 // The safety checks. It records the first execution of each operation, and
@@ -262,19 +274,33 @@ public:
     return *log_[p_op];
   }
 
-  void OnRestart(std::size_t p_replica) { executed_ops_[p_replica] = 0; }
+  // A replica starts with a new application. Each new application must
+  // hold the same state.
+  void OnStart(std::size_t p_replica, std::uint64_t p_digest)
+  {
+    executed_ops_[p_replica] = 0;
+    if (!initial_digest_.has_value())
+    {
+      initial_digest_ = p_digest;
+    }
+    else if (*initial_digest_ != p_digest)
+    {
+      Fail(std::format("replica {} started with a different initial state", p_replica));
+    }
+  }
 
-  void OnRestore(std::size_t p_replica, std::uint64_t p_op, std::uint64_t p_state_hash)
+  void OnRestore(std::size_t p_replica, std::uint64_t p_op, std::uint64_t p_digest)
   {
     // A snapshot from before the first execution holds the initial state.
-    const bool initial = p_op == 0 && p_state_hash == 0;
-    if (!initial && !Has(p_op))
+    const bool known = p_op == 0 || Has(p_op);
+    if (!known)
     {
       Fail(std::format("replica {} restored a snapshot at op {} that no replica executed",
                        p_replica, p_op));
       return;
     }
-    if (!initial && At(p_op).state_hash_ != p_state_hash)
+    const std::uint64_t expected = p_op == 0 ? initial_digest_.value_or(0) : At(p_op).digest_;
+    if (expected != p_digest)
     {
       Fail(std::format("replica {} restored a wrong state at op {}", p_replica, p_op));
     }
@@ -294,7 +320,8 @@ public:
     if (op <= HighestOp())
     {
       // Another replica went past this operation. It must have executed it:
-      // the state hash covers the order, but this gives the clearer message.
+      // the digest does not always cover the order, and this gives the
+      // clearer message.
       if (!Has(op))
       {
         Fail(std::format("replica {} executed op {} that another replica did not execute",
@@ -307,9 +334,13 @@ public:
       {
         Fail(std::format("replica {} executed a different operation at op {}", p_replica, op));
       }
-      else if (first.state_hash_ != p_result.state_hash_ || first.reply_ != p_result.reply_)
+      else if (first.digest_ != p_result.digest_)
       {
         Fail(std::format("replica {} has a different state after op {}", p_replica, op));
+      }
+      else if (first.reply_checksum_ != p_result.reply_checksum_)
+      {
+        Fail(std::format("replica {} made a different reply for op {}", p_replica, op));
       }
       return;
     }
@@ -335,22 +366,18 @@ private:
   std::vector<std::optional<Committed>> log_;
   std::vector<std::uint64_t> executed_ops_;
   std::unordered_map<std::uint64_t, std::uint64_t> requests_last_;
+  std::optional<std::uint64_t> initial_digest_;
   std::uint64_t timestamp_last_ns_ = 0;
   std::uint64_t executed_count_ = 0;
   std::string failure_;
 };
 
-// A state machine whose state is a hash of every operation that it executed.
-// Two replicas have equal hashes only if they executed the same operations
-// in the same order.
-class SimStateMachine final : public StateMachine
+// The default application. Its state is a hash of every operation that it
+// executed. Two replicas have equal hashes only if they executed the same
+// operations in the same order.
+class HashApplication final : public Application
 {
 public:
-  SimStateMachine(Checker *p_checker, std::size_t p_replica)
-      : checker_(p_checker), replica_(p_replica)
-  {
-  }
-
   [[nodiscard]] std::size_t Execute(const Operation &p_operation, std::span<const std::byte> p_body,
                                     std::span<std::byte> p_reply) override
   {
@@ -358,55 +385,45 @@ public:
         state_hash_,         p_operation.op_,      p_operation.timestamp_ns_,
         p_operation.client_, p_operation.request_, Checksum(p_body)};
     state_hash_ = Checksum(std::as_bytes(std::span{input}));
-    last_op_ = p_operation.op_;
-
-    Committed result;
-    result.client_ = p_operation.client_;
-    result.request_ = p_operation.request_;
-    result.timestamp_ns_ = p_operation.timestamp_ns_;
-    result.state_hash_ = state_hash_;
-    std::memcpy(result.reply_.data(), &state_hash_, sizeof(state_hash_));
-    std::memcpy(result.reply_.data() + sizeof(state_hash_), &last_op_, sizeof(last_op_));
-    VSR_ASSERT(p_reply.size() >= kReplyBytes);
-    std::memcpy(p_reply.data(), result.reply_.data(), kReplyBytes);
-    checker_->OnExecute(replica_, p_operation, result);
-    return kReplyBytes;
+    VSR_ASSERT(p_reply.size() >= kHashReplyBytes);
+    std::memcpy(p_reply.data(), &state_hash_, sizeof(state_hash_));
+    std::memcpy(p_reply.data() + sizeof(state_hash_), &p_operation.op_, sizeof(p_operation.op_));
+    return kHashReplyBytes;
   }
 
   [[nodiscard]] std::expected<std::size_t, std::monostate>
   Snapshot(std::span<std::byte> p_out) override
   {
-    if (p_out.size() < kSnapshotBytes)
+    if (p_out.size() < kHashSnapshotBytes)
     {
       return std::unexpected(std::monostate{});
     }
     std::memcpy(p_out.data(), &state_hash_, sizeof(state_hash_));
-    std::memcpy(p_out.data() + sizeof(state_hash_), &last_op_, sizeof(last_op_));
-    for (std::size_t index = 0; index < kSnapshotPaddingBytes; ++index)
+    for (std::size_t index = 0; index < kHashSnapshotPaddingBytes; ++index)
     {
-      p_out[2 * sizeof(std::uint64_t) + index] = PaddingByte(index);
+      p_out[sizeof(state_hash_) + index] = PaddingByte(index);
     }
-    return kSnapshotBytes;
+    return kHashSnapshotBytes;
   }
 
   [[nodiscard]] bool Restore(std::span<const std::byte> p_snapshot) override
   {
-    if (p_snapshot.size() != kSnapshotBytes)
+    if (p_snapshot.size() != kHashSnapshotBytes)
     {
       return false;
     }
     std::memcpy(&state_hash_, p_snapshot.data(), sizeof(state_hash_));
-    std::memcpy(&last_op_, p_snapshot.data() + sizeof(state_hash_), sizeof(last_op_));
-    for (std::size_t index = 0; index < kSnapshotPaddingBytes; ++index)
+    for (std::size_t index = 0; index < kHashSnapshotPaddingBytes; ++index)
     {
-      if (p_snapshot[2 * sizeof(std::uint64_t) + index] != PaddingByte(index))
+      if (p_snapshot[sizeof(state_hash_) + index] != PaddingByte(index))
       {
         return false;
       }
     }
-    checker_->OnRestore(replica_, last_op_, state_hash_);
     return true;
   }
+
+  [[nodiscard]] std::uint64_t Digest() const override { return state_hash_; }
 
 private:
   [[nodiscard]] std::byte PaddingByte(std::size_t p_index) const noexcept
@@ -414,9 +431,93 @@ private:
     return static_cast<std::byte>((state_hash_ >> (p_index % 8 * 8)) & 0xFFU);
   }
 
+  std::uint64_t state_hash_ = 0;
+};
+
+// The state machine that a replica gets. It passes each call to the
+// application, and gives each result to the checker.
+class CheckedStateMachine final : public StateMachine
+{
+public:
+  CheckedStateMachine(Checker *p_checker, std::size_t p_replica,
+                      const ApplicationFactory *p_factory)
+      : checker_(p_checker), replica_(p_replica), factory_(p_factory), application_((*p_factory)())
+  {
+    VSR_ASSERT(application_ != nullptr);
+    checker_->OnStart(replica_, application_->Digest());
+  }
+
+  [[nodiscard]] std::size_t Execute(const Operation &p_operation, std::span<const std::byte> p_body,
+                                    std::span<std::byte> p_reply) override
+  {
+    std::size_t reply_bytes = application_->Execute(p_operation, p_body, p_reply);
+    if (reply_bytes > p_reply.size())
+    {
+      checker_->Fail(std::format("the reply for op {} is larger than the limit", p_operation.op_));
+      reply_bytes = 0;
+    }
+    last_op_ = p_operation.op_;
+
+    Committed result;
+    result.client_ = p_operation.client_;
+    result.request_ = p_operation.request_;
+    result.timestamp_ns_ = p_operation.timestamp_ns_;
+    result.digest_ = application_->Digest();
+    result.reply_checksum_ = Checksum(p_reply.first(reply_bytes));
+    checker_->OnExecute(replica_, p_operation, result);
+    return reply_bytes;
+  }
+
+  [[nodiscard]] std::expected<std::size_t, std::monostate>
+  Snapshot(std::span<std::byte> p_out) override
+  {
+    if (p_out.size() < kSnapshotHeaderBytes)
+    {
+      return std::unexpected(std::monostate{});
+    }
+    const auto state_bytes = application_->Snapshot(p_out.subspan(kSnapshotHeaderBytes));
+    if (!state_bytes)
+    {
+      return std::unexpected(std::monostate{});
+    }
+    std::memcpy(p_out.data(), &last_op_, sizeof(last_op_));
+    CheckSnapshot(p_out.subspan(kSnapshotHeaderBytes, *state_bytes));
+    return kSnapshotHeaderBytes + *state_bytes;
+  }
+
+  [[nodiscard]] bool Restore(std::span<const std::byte> p_snapshot) override
+  {
+    if (p_snapshot.size() < kSnapshotHeaderBytes)
+    {
+      return false;
+    }
+    if (!application_->Restore(p_snapshot.subspan(kSnapshotHeaderBytes)))
+    {
+      return false;
+    }
+    std::memcpy(&last_op_, p_snapshot.data(), sizeof(last_op_));
+    checker_->OnRestore(replica_, last_op_, application_->Digest());
+    return true;
+  }
+
+private:
+  // Each snapshot must give the same state in a new application. This also
+  // checks the snapshots that no replica installs.
+  void CheckSnapshot(std::span<const std::byte> p_state)
+  {
+    const auto copy = (*factory_)();
+    if (!copy->Restore(p_state) || copy->Digest() != application_->Digest())
+    {
+      checker_->Fail(std::format("replica {}: the snapshot after op {} does not restore the "
+                                 "same state",
+                                 replica_, last_op_));
+    }
+  }
+
   Checker *checker_;
   std::size_t replica_;
-  std::uint64_t state_hash_ = 0;
+  const ApplicationFactory *factory_;
+  std::unique_ptr<Application> application_;
   std::uint64_t last_op_ = 0;
 };
 
@@ -425,6 +526,10 @@ struct Packet
   std::uint64_t deliver_tick_ = 0;
   std::uint64_t sequence_ = 0;
   bool to_client_ = false;
+  // A request that the host gives to `Replica::Submit`.
+  bool submit_ = false;
+  // The host already sent this request on to the primary.
+  bool forwarded_ = false;
   std::uint64_t source_replica_ = 0;
   std::uint64_t target_ = 0;
   std::vector<std::byte> bytes_;
@@ -438,6 +543,38 @@ struct PacketLater
            std::pair{p_right.deliver_tick_, p_right.sequence_};
   }
 };
+
+// One trace line for a packet.
+[[nodiscard]] std::string Describe(const Packet &p_packet)
+{
+  VSR_ASSERT(p_packet.bytes_.size() >= kHeaderBytes);
+  Header header;
+  std::memcpy(&header, p_packet.bytes_.data(), kHeaderBytes);
+  const std::size_t command = std::to_underlying(header.command_);
+  const std::string_view name = command < kCommandNames.size() ? kCommandNames[command] : "Unknown";
+  if (p_packet.to_client_)
+  {
+    return std::format("{} to client {} request {} op {} view {}", name, p_packet.target_,
+                       header.request_, header.op_, header.view_);
+  }
+  if (header.command_ == Command::Request)
+  {
+    return std::format("{} client {} request {} to replica {}{}",
+                       p_packet.submit_ ? "Submit" : "Request", header.client_, header.request_,
+                       p_packet.target_, p_packet.forwarded_ ? " (sent on)" : "");
+  }
+  std::uint64_t op = header.op_;
+  if (header.command_ == Command::Prepare &&
+      p_packet.bytes_.size() >= kHeaderBytes + kEntryHeaderBytes)
+  {
+    // The operation number of a Prepare is in the log entry.
+    EntryHeader entry;
+    std::memcpy(&entry, p_packet.bytes_.data() + kHeaderBytes, kEntryHeaderBytes);
+    op = entry.op_;
+  }
+  return std::format("{} {}->{} view {} op {} commit {}", name, p_packet.source_replica_,
+                     p_packet.target_, header.view_, op, header.commit_);
+}
 
 struct Client
 {
@@ -479,10 +616,14 @@ struct Node
 
   SimStorage storage_;
   SimBus bus_;
-  std::unique_ptr<SimStateMachine> state_machine_;
+  std::unique_ptr<CheckedStateMachine> state_machine_;
   std::optional<Replica> replica_;
   std::uint64_t restart_tick_ = 0;
   std::uint64_t clock_skew_ns_ = 0;
+  // The state in the last trace line of this replica.
+  std::uint32_t traced_view_ = 0;
+  Status traced_status_ = Status::Halted;
+  std::uint64_t traced_commit_ = 0;
   bool isolated_ = false;
 };
 
@@ -490,11 +631,17 @@ class Cluster final
 {
 public:
   explicit Cluster(const Options &p_options)
-      : options_(p_options), random_(p_options.seed_), checker_(p_options.replica_count_)
+      : options_(p_options), config_(SimulationConfig(p_options, 0)),
+        factory_(p_options.application_factory_), random_(p_options.seed_),
+        checker_(p_options.replica_count_)
   {
+    if (!factory_)
+    {
+      factory_ = [] { return std::make_unique<HashApplication>(); };
+    }
     for (std::uint8_t replica = 0; replica < options_.replica_count_; ++replica)
     {
-      const Config config = SimulationConfig(options_.replica_count_, replica);
+      const Config config = SimulationConfig(options_, replica);
       nodes_.push_back(std::make_unique<Node>(this, replica, StorageBytes(config)));
       nodes_.back()->clock_skew_ns_ = random_.Below(options_.clock_skew_ns_max_ + 1);
       if (!Format(nodes_.back()->storage_, config))
@@ -540,7 +687,12 @@ public:
     {
       CheckLiveness();
     }
-    return MakeResult();
+    Result result = MakeResult();
+    if (!result.ok_)
+    {
+      Trace("FAIL {}", result.failure_);
+    }
+    return result;
   }
 
   void SendToReplica(std::uint8_t p_source, std::uint8_t p_target,
@@ -564,6 +716,49 @@ public:
   }
 
 private:
+  template <typename... TArgs> void Trace(std::format_string<TArgs...> p_format, TArgs &&...p_args)
+  {
+    if (options_.trace_)
+    {
+      options_.trace_(
+          std::format("{:>6} {}", tick_, std::format(p_format, std::forward<TArgs>(p_args)...)));
+    }
+  }
+
+  // The same, for a line that is expensive to make.
+  void TracePacket(std::string_view p_event, const Packet &p_packet)
+  {
+    if (options_.trace_)
+    {
+      Trace("{} {}", p_event, Describe(p_packet));
+    }
+  }
+
+  // Writes the state of a replica if the view, the status, or the last
+  // executed operation changed.
+  void TraceState(std::size_t p_replica)
+  {
+    auto &node = *nodes_[p_replica];
+    if (!options_.trace_ || !node.replica_)
+    {
+      return;
+    }
+    const Replica &replica = *node.replica_;
+    const bool changed = node.traced_view_ != replica.View() ||
+                         node.traced_status_ != replica.GetStatus() ||
+                         node.traced_commit_ != replica.CommitMin();
+    if (!changed)
+    {
+      return;
+    }
+    node.traced_view_ = replica.View();
+    node.traced_status_ = replica.GetStatus();
+    node.traced_commit_ = replica.CommitMin();
+    Trace("state   replica {} view {} status {}{} log head {} executed {}", p_replica,
+          replica.View(), kStatusNames[std::to_underlying(replica.GetStatus())],
+          replica.IsPrimary() ? " primary" : "", replica.Op(), replica.CommitMin());
+  }
+
   // A PrepareOk and a DoViewChange promise that the sender holds the log up
   // to an operation. The promise is false after a power loss if one of
   // these entries is not yet synced.
@@ -604,8 +799,7 @@ private:
   // executes the operation.
   void CheckCommittedOpsAreDurable()
   {
-    const Config config = SimulationConfig(options_.replica_count_, 0);
-    const auto layout = internal::MakeLayout(config);
+    const auto layout = internal::MakeLayout(config_);
     std::vector<std::byte> slot(layout.slot_bytes_);
     while (durable_checked_ops_ < checker_.HighestOp())
     {
@@ -642,6 +836,7 @@ private:
   {
     if (chaos_ && random_.Chance(options_.drop_rate_))
     {
+      TracePacket("drop   ", p_packet);
       return;
     }
     const std::uint32_t delay_max = chaos_ ? options_.delay_ticks_max_ : 1;
@@ -651,20 +846,21 @@ private:
       Packet copy = p_packet;
       copy.deliver_tick_ = tick_ + 1 + random_.Below(delay_max);
       copy.sequence_ = sequence_next_++;
+      TracePacket("repeat ", copy);
       packets_.push(std::move(copy));
     }
     p_packet.deliver_tick_ = tick_ + 1 + random_.Below(delay_max);
     p_packet.sequence_ = sequence_next_++;
+    TracePacket("send   ", p_packet);
     packets_.push(std::move(p_packet));
   }
 
   void Start(std::size_t p_replica)
   {
     auto &node = *nodes_[p_replica];
-    checker_.OnRestart(p_replica);
-    node.state_machine_ = std::make_unique<SimStateMachine>(&checker_, p_replica);
-    const Config config =
-        SimulationConfig(options_.replica_count_, static_cast<std::uint8_t>(p_replica));
+    node.state_machine_ = std::make_unique<CheckedStateMachine>(&checker_, p_replica, &factory_);
+    const Config config = SimulationConfig(options_, static_cast<std::uint8_t>(p_replica));
+    Trace("start   replica {}", p_replica);
     auto replica = Replica::Open(config, node.storage_, node.bus_, *node.state_machine_);
     if (!replica)
     {
@@ -674,12 +870,15 @@ private:
     }
     node.replica_.emplace(std::move(*replica));
     node.restart_tick_ = 0;
+    node.traced_status_ = Status::Halted;
+    TraceState(p_replica);
   }
 
   void Crash(std::size_t p_replica)
   {
     auto &node = *nodes_[p_replica];
     VSR_ASSERT(node.replica_.has_value());
+    Trace("crash   replica {}", p_replica);
     Collect(*node.replica_);
     node.replica_.reset();
     node.state_machine_.reset();
@@ -702,6 +901,7 @@ private:
   void CheckNode(std::size_t p_replica)
   {
     CheckCommittedOpsAreDurable();
+    TraceState(p_replica);
     auto &node = *nodes_[p_replica];
     if (!node.replica_ || node.replica_->GetStatus() != Status::Halted)
     {
@@ -733,8 +933,9 @@ private:
       }
       else if (random_.Chance(options_.storage_fault_rate_))
       {
-        node.storage_.InjectFault(1 +
-                                  static_cast<std::uint32_t>(random_.Below(kStorageFaultOpsMax)));
+        const auto operations = 1 + static_cast<std::uint32_t>(random_.Below(kStorageFaultOpsMax));
+        Trace("fault   replica {} storage fails at operation {} from now", replica, operations);
+        node.storage_.InjectFault(operations);
       }
     }
     if (random_.Chance(options_.partition_rate_))
@@ -747,13 +948,20 @@ private:
       }
       if (!any_isolated)
       {
-        nodes_[random_.Below(nodes_.size())]->isolated_ = true;
+        const std::uint64_t isolated = random_.Below(nodes_.size());
+        nodes_[isolated]->isolated_ = true;
+        Trace("fault   partition: replica {} is isolated", isolated);
+      }
+      else
+      {
+        Trace("fault   partition ends");
       }
     }
   }
 
   void Heal()
   {
+    Trace("heal    the faults stop");
     for (auto &node : nodes_)
     {
       node->isolated_ = false;
@@ -791,9 +999,18 @@ private:
       const bool link_down = node.isolated_ || nodes_[packet.source_replica_]->isolated_;
       if (!node.replica_ || (link_down && packet.source_replica_ != packet.target_))
       {
+        TracePacket(node.replica_ ? "cut    " : "lost   ", packet);
         continue;
       }
-      node.replica_->OnMessage(packet.bytes_);
+      TracePacket("deliver", packet);
+      if (packet.submit_)
+      {
+        SubmitRequest(packet);
+      }
+      else
+      {
+        node.replica_->OnMessage(packet.bytes_);
+      }
       // A host can flush after one message or after several. The power can
       // fail before the flush.
       if (!chaos_ || random_.Below(4) != 0)
@@ -809,11 +1026,53 @@ private:
     }
   }
 
+  // The path of a host with its own client protocol: the host decodes the
+  // request and calls `Submit`. A host that is not the primary sends the
+  // request on to the primary one time, as a replica does for a `Request`.
+  void SubmitRequest(const Packet &p_packet)
+  {
+    Replica &replica = *nodes_[p_packet.target_]->replica_;
+    const auto message = DecodeMessage(p_packet.bytes_);
+    VSR_ASSERT(message.has_value());
+    const Header &header = message->header_;
+    const bool was_primary = replica.IsPrimary();
+    const std::uint64_t head_before = replica.Op();
+    const SubmitResult result =
+        replica.Submit(header.client_, header.request_, header.session_, message->body_);
+    const bool appended = replica.Op() == head_before + 1;
+    // A valid request is `Invalid` only when the storage fails.
+    const bool consistent = result == SubmitResult::Invalid
+                                ? replica.GetStatus() == Status::Halted
+                                : (result == SubmitResult::NotPrimary) != was_primary &&
+                                      (result == SubmitResult::Accepted) == appended;
+    if (!consistent)
+    {
+      checker_.Fail(std::format("replica {}: Submit of client {} request {} gave result {}, "
+                                "primary {}, log head {} then {}",
+                                p_packet.target_, header.client_, header.request_,
+                                std::to_underlying(result), was_primary, head_before,
+                                replica.Op()));
+    }
+    submits_accepted_ += result == SubmitResult::Accepted ? 1U : 0U;
+    Trace("submit  replica {} client {} request {} result {}", p_packet.target_, header.client_,
+          header.request_, std::to_underlying(result));
+    const bool view_is_open =
+        replica.GetStatus() == Status::Normal || replica.GetStatus() == Status::Joining;
+    if (result == SubmitResult::NotPrimary && view_is_open && !p_packet.forwarded_)
+    {
+      Packet forward = p_packet;
+      forward.forwarded_ = true;
+      forward.source_replica_ = replica.PrimaryIndex();
+      forward.target_ = replica.PrimaryIndex();
+      Enqueue(std::move(forward));
+    }
+  }
+
   void SendRequest(Client &p_client, std::uint64_t p_replica)
   {
     Header header;
     header.command_ = Command::Request;
-    header.cluster_ = SimulationConfig(options_.replica_count_, 0).cluster_;
+    header.cluster_ = config_.cluster_;
     header.client_ = p_client.id_;
     header.request_ = p_client.request_;
     header.session_ = p_client.session_;
@@ -824,15 +1083,34 @@ private:
     // state of the target decides the delivery.
     packet.source_replica_ = p_replica;
     packet.target_ = p_replica;
+    packet.submit_ = random_.Chance(options_.submit_rate_);
     packet.bytes_.assign(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(message_bytes));
     Enqueue(std::move(packet));
     p_client.retry_tick_ = tick_ + kClientRetryTicks;
   }
 
+  [[nodiscard]] std::vector<std::byte> MakeBody()
+  {
+    if (options_.body_generator_)
+    {
+      auto body = options_.body_generator_(random_.Next());
+      if (body.size() > config_.body_bytes_max_)
+      {
+        checker_.Fail("the body generator made a body that is larger than the limit");
+        body.clear();
+      }
+      return body;
+    }
+    std::vector<std::byte> body(random_.Below(config_.body_bytes_max_ + 1));
+    for (auto &byte : body)
+    {
+      byte = static_cast<std::byte>(random_.Below(256));
+    }
+    return body;
+  }
+
   void StepClients(bool p_start_requests)
   {
-    const std::uint32_t body_bytes_max =
-        SimulationConfig(options_.replica_count_, 0).body_bytes_max_;
     for (auto &client : clients_)
     {
       if (client.waiting_)
@@ -853,11 +1131,7 @@ private:
       if (client.registered_)
       {
         client.request_ += 1;
-        client.body_.resize(random_.Below(body_bytes_max + 1));
-        for (auto &byte : client.body_)
-        {
-          byte = static_cast<std::byte>(random_.Below(256));
-        }
+        client.body_ = MakeBody();
       }
       client.waiting_ = true;
       client.committed_before_ = checker_.HighestOp();
@@ -879,10 +1153,12 @@ private:
     p_client.waiting_ = false;
     p_client.next_send_tick_ = tick_ + random_.Below(kClientThinkTicksMax);
     evictions_ += 1;
+    Trace("client  {} has a new identifier after an eviction", p_client.id_);
   }
 
   void OnClientPacket(const Packet &p_packet)
   {
+    TracePacket("deliver", p_packet);
     const auto message = DecodeMessage(p_packet.bytes_);
     const bool known_command =
         message.has_value() && (message->header_.command_ == Command::Reply ||
@@ -928,6 +1204,7 @@ private:
     client.view_hint_ = std::max(client.view_hint_, header.view_);
     client.next_send_tick_ = tick_ + random_.Below(kClientThinkTicksMax);
     requests_completed_ += 1;
+    Trace("client  {} request {} is complete at op {}", client.id_, client.request_, header.op_);
   }
 
   [[nodiscard]] bool CheckReply(const Client &p_client, const Message &p_message)
@@ -944,7 +1221,7 @@ private:
     const auto &committed = checker_.At(header.op_);
     const bool same_request =
         committed.client_ == p_client.id_ && committed.request_ == p_client.request_;
-    const bool same_reply = std::ranges::equal(p_message.body_, committed.reply_);
+    const bool same_reply = Checksum(p_message.body_) == committed.reply_checksum_;
     if (!same_request || !same_reply)
     {
       checker_.Fail(std::format("client {} request {}: wrong reply for op {}", p_client.id_,
@@ -1048,6 +1325,7 @@ private:
     result.committed_ops_ = checker_.ExecutedCount();
     result.evictions_ = evictions_;
     result.requests_completed_ = requests_completed_;
+    result.submits_accepted_ = submits_accepted_;
     result.crashes_ = crashes_;
     result.view_max_ = view_max_;
     result.checkpoints_ = checkpoints_;
@@ -1056,6 +1334,9 @@ private:
   }
 
   Options options_;
+  // The configuration of replica 0. Only `replica_` differs between replicas.
+  Config config_;
+  ApplicationFactory factory_;
   Random random_;
   Checker checker_;
   std::vector<std::unique_ptr<Node>> nodes_;
@@ -1069,6 +1350,7 @@ private:
   std::unordered_map<std::uint64_t, std::size_t> client_indexes_;
   bool chaos_ = false;
   std::uint64_t requests_completed_ = 0;
+  std::uint64_t submits_accepted_ = 0;
   std::uint64_t crashes_ = 0;
   std::uint64_t view_max_ = 0;
   std::uint64_t checkpoints_ = 0;
@@ -1089,23 +1371,32 @@ void SimBus::SendToClient(std::uint64_t p_client, std::span<const std::byte> p_m
 
 } // namespace
 
-Config SimulationConfig(std::uint8_t p_replica_count, std::uint8_t p_replica)
+Config SimulationConfig(const Options &p_options, std::uint8_t p_replica)
 {
+  const Limits &limits = p_options.limits_;
   Config config;
   config.cluster_ = 0x5652'5F53'494D;
-  config.replica_count_ = p_replica_count;
+  config.replica_count_ = p_options.replica_count_;
   config.replica_ = p_replica;
-  config.body_bytes_max_ = 128;
-  config.pipeline_max_ = 4;
-  config.clients_max_ = 8;
-  config.log_slot_count_ = 32;
-  config.checkpoint_interval_ = 8;
-  config.snapshot_bytes_max_ = 1024;
+  config.body_bytes_max_ = limits.body_bytes_max_;
+  config.pipeline_max_ = limits.pipeline_max_;
+  config.clients_max_ = limits.clients_max_;
+  config.log_slot_count_ = limits.log_slot_count_;
+  config.checkpoint_interval_ = limits.checkpoint_interval_;
+  config.snapshot_bytes_max_ = limits.snapshot_bytes_max_ + kSnapshotHeaderBytes;
   return config;
 }
 
 Result Run(const Options &p_options)
 {
+  if (const auto valid = ValidateConfig(SimulationConfig(p_options, 0)); !valid)
+  {
+    Result result;
+    result.ok_ = false;
+    result.failure_ = std::format("the options are not valid: configuration error {}",
+                                  std::to_underlying(valid.error()));
+    return result;
+  }
   Cluster cluster{p_options};
   return cluster.Run();
 }

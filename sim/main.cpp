@@ -1,4 +1,4 @@
-#include "simulation.hpp"
+#include "vsr/sim/simulation.hpp"
 
 #include <charconv>
 #include <cstdio>
@@ -17,9 +17,33 @@ namespace
 
 } // namespace
 
-// Usage: vsr_sim [first_seed] [seed_count] [replica_count] [chaos_ticks] [client_count]
+// Usage: vsr_sim [first_seed] [seed_count] [replica_count] [chaos_ticks] [client_count] [--trace]
+//
+// `--trace` prints one line for each event of each seed. Use it with one
+// seed, to find the cause of a failure.
 int main(int p_argc, char **p_argv)
 {
+  // The options start with `--`. The other arguments keep their positions.
+  bool trace = false;
+  int positional_count = 1;
+  for (int index = 1; index < p_argc; ++index)
+  {
+    const std::string_view argument = p_argv[index];
+    if (argument == "--trace")
+    {
+      trace = true;
+    }
+    else if (argument.starts_with("--"))
+    {
+      std::fprintf(stderr, "unknown option %s\n", p_argv[index]);
+      return EXIT_FAILURE;
+    }
+    else
+    {
+      p_argv[positional_count++] = p_argv[index];
+    }
+  }
+  p_argc = positional_count;
   const std::uint64_t first_seed = p_argc > 1 ? ParseNumber(p_argv[1], 1) : 1;
   const std::uint64_t seed_count = p_argc > 2 ? ParseNumber(p_argv[2], 1) : 1;
   vsr::sim::Options options;
@@ -34,6 +58,11 @@ int main(int p_argc, char **p_argv)
   if (p_argc > 5)
   {
     options.client_count_ = static_cast<std::uint32_t>(ParseNumber(p_argv[5], 4));
+  }
+  if (trace)
+  {
+    options.trace_ = [](std::string_view p_line)
+    { std::printf("%.*s\n", static_cast<int>(p_line.size()), p_line.data()); };
   }
   std::uint64_t committed_ops = 0;
   std::uint64_t evictions = 0;

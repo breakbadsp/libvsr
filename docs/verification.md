@@ -5,7 +5,7 @@
 | Check | Command | What it shows |
 |-------|---------|---------------|
 | Unit and integration tests | `ctest --preset gcc` (also `clang`, `gcc-san`, `clang-san`) | The host contract of one replica, the formats, the journal, and a real three-replica cluster on TCP and files. |
-| Simulation | `./build/gcc/sim/vsr_sim <first seed> <seed count> <replicas> [chaos ticks]` | Safety with faults, and recovery after the faults stop. |
+| Simulation | `./build/gcc/sim/vsr_sim <first seed> <seed count> <replicas> [chaos ticks] [clients] [--trace]` | Safety with faults, and recovery after the faults stop. |
 | Mutation check of the simulator | see below | The simulator fails when the protocol has a known defect. |
 | TLA+ model | `spec/run.sh` | The view change and join rules, for all interleavings in a small model. |
 | Fuzzing | `-DVSR_BUILD_FUZZ=ON` with Clang, target `vsr_decode_fuzz` | Bytes from the network cannot crash the decoders. |
@@ -21,6 +21,12 @@ replica crashes; power loss during a storage call, where each write that
 was not synced is lost, kept, or torn; a partition of one replica; a host
 that flushes late; clocks that differ between replicas.
 
+A share of the client requests (`Options::submit_rate_`) goes to
+`Replica::Submit`, the path of a host with its own client protocol. The
+other requests are `Request` messages for `Replica::OnMessage`. A host
+that is not the primary sends a submitted request on to the primary one
+time.
+
 Checks during the run:
 
 - Each replica executes operations in order with no gap.
@@ -30,6 +36,12 @@ Checks during the run:
 - No request executes more than once.
 - A client reply names the right operation and has the right body, and the
   operation committed after the request was sent.
+- `Submit` gives `NotPrimary` only on a replica that is not the primary,
+  `Accepted` only with one new log entry, and `Invalid` only after a
+  storage fault.
+- Each new application has the same initial state. Each snapshot gives the
+  same state in a new application, and a replica that restores a snapshot
+  has the state that the first replica had after that operation.
 - When an operation first executes, a quorum holds it on durable storage.
 - A replica sends `PrepareOk` or `DoViewChange` only when the log and the
   view that the message promises are durable.
@@ -38,6 +50,37 @@ Checks during the run:
 Checks after the faults stop: each client request gets its reply, all
 replicas are `Normal` in one view with one primary, and all replicas
 executed all operations.
+
+### Run a host application in the simulator
+
+The simulator can run the state machine of a host in place of its own hash
+state machine, with the same faults and checks. The interface is in
+`sim/include/vsr/sim/simulation.hpp`:
+
+- `vsr::sim::Application` is a `vsr::StateMachine` with one more function,
+  `Digest()`: a checksum of the full state. The simulator compares the
+  digest and the reply across replicas after each operation.
+- `Options::application_factory_` makes one application for each start of
+  each replica.
+- `Options::body_generator_` makes a valid request body from one random
+  number.
+- `Options::limits_` sets the replica limits, for example
+  `body_bytes_max_` and `snapshot_bytes_max_`.
+
+In CMake, add libvsr with `add_subdirectory(libvsr EXCLUDE_FROM_ALL)` and
+link the target `vsr_sim_lib`. Set `VSR_BUILD_TESTS` and
+`VSR_BUILD_EXAMPLES` to `OFF` if the project does not need them.
+`tests/simulation_test.cpp` has an example, `SumApplication`.
+
+### Find the cause of a failed seed
+
+`vsr_sim <seed> 1 <replicas> --trace` prints one line for each event of
+the seed: each fault, each message that is sent, delivered, repeated, or
+dropped, each crash and start, each `Submit` result, each completed
+request, and each change of the view, the status, or the executed
+operation of a replica. Each line starts with the tick. The same seed
+gives the same lines. A program that uses the library sets
+`Options::trace_`.
 
 ## Mutation check
 
@@ -79,8 +122,34 @@ has three mutated configurations, and TLC finds a counterexample for each.
 The bounds are small: three replicas, at most three views, and a log of
 one to three entries. The model does not prove the protocol for all sizes.
 
+## Defect that the simulator found
+
+Seed 1780 with three replicas failed with `replica 0 executed a different
+operation at op 15`. About one fresh seed in 5000 failed for the same
+cause, in the journal:
+
+1. A power loss lost the unsynced entry 14 and kept the unsynced entry
+   15. Recovery stopped at entry 13, and the old entry 15 stayed in its slot.
+2. In the next view the replica got the same entry 14 again from the new
+   primary. The old entry 15 then linked to the head of the log.
+3. After one more restart, recovery read the old entry 15 as a part of
+   the log. The replica was a backup in an open view, so it did not check
+   its log against the primary. It executed the old entry 15, and the
+   primary committed a different entry 15.
+
+Recovery now erases each entry after the head, and truncation erases each
+removed entry. The test `Simulation.StaleEntryAfterLostWrite` runs the seed.
+
 ## Known gaps
 
+- The simulator cuts only one replica from the others. It has no
+  asymmetric cut and no split into two groups.
+- Each replica clock has a fixed offset. The simulator has no drift and no
+  clock jump.
+- The fault rates are equal for each seed. The simulator does not select a
+  different mix of faults for each seed (swarm testing).
+- The liveness check runs with all replicas up. No run keeps a minority of
+  the replicas down after the faults stop.
 - The simulator does not inject disk corruption. That failure type is not
   in version 1.
 - The TCP runner and the client have integration tests on one machine.
