@@ -35,13 +35,15 @@ jobs:
         env:
           ALMA_VERSION: ${{ matrix.version }}
           CI_CHECK: ${{ matrix.check }}
+          # A new value for each run and each rerun. It sets the fresh seeds.
+          CI_SEED_SOURCE: ${{ github.sha }}:${{ github.run_id }}:${{ github.run_attempt }}
         run: |
           mkdir -p reports
           git rev-parse HEAD > reports/commit.txt
           image="$(bash .github/scripts/almalinux-image.sh)"
           docker image inspect "$image" > reports/image.json
           docker run --rm --cap-drop ALL --security-opt no-new-privileges \
-            -e ALMA_VERSION -e CI_CHECK \
+            -e ALMA_VERSION -e CI_CHECK -e CI_SEED_SOURCE \
             -v "$PWD:/source:ro" -v "$PWD/reports:/reports" \
             "$image" bash /source/.github/scripts/almalinux-build.sh
       - name: Save build and test logs

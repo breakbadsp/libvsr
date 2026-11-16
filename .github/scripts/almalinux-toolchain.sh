@@ -15,5 +15,5 @@ dnf install -y dnf-plugins-core
 dnf config-manager --set-enabled "$development_repo"
 dnf install -y gcc-toolset-14-gcc-c++ gcc-toolset-14-libstdc++-devel \
   gcc-toolset-14-libasan-devel gcc-toolset-14-libubsan-devel \
-  clang compiler-rt cmake ninja-build gtest-devel git tar gzip
+  clang compiler-rt cmake ninja-build gtest-devel git tar gzip python3
 dnf clean all

@@ -85,17 +85,37 @@ one to three entries. The model does not prove the protocol for all sizes.
   in version 1.
 - The TCP runner and the client have integration tests on one machine.
   They have no fault injection on real networks or disks (Jepsen-style).
-- No test runs more than a few minutes. A long soak (millions of seeds)
-  is a task for CI or a dedicated machine.
+- The nightly soak runs for about one hour on four cores. That is hundreds
+  of thousands of seeds each night, not millions. A longer soak needs a
+  dedicated machine. Run it with the `workflow_dispatch` inputs of the
+  `Nightly soak` workflow.
 
 ## AlmaLinux CI
 
 PR checks use a prepared AlmaLinux 8 container on the Omarchy `libvsr`
 runner. Fork PRs use GitHub-hosted runners. Both GCC and Clang run tests
-and 300 simulation seeds for three and five replicas, with and without
-ASan/UBSan. A separate job fuzzes the instrumented decoder for 60 seconds.
+and simulation seeds for three and five replicas, with and without
+ASan/UBSan. The seeds are in two sets. The fixed set is seeds 1..300. It
+is the regression set. The fresh set is 200 seeds that start at a value
+from the commit SHA, `GITHUB_RUN_ID`, and `GITHUB_RUN_ATTEMPT`. Each run
+and each rerun gets new seeds. The log shows each range on a `SEEDS` line.
+A failure prints a `REPLAY` line with the command to replay the failed
+seed. A failed fresh seed is a real defect: add it to the tests. A separate job fuzzes the instrumented decoder for 60 seconds.
 Each job keeps its source mount read-only and builds in a disposable
 container. Build logs, package versions, and CTest logs are CI artifacts.
+
+The `Nightly soak` workflow runs each day on the default branch, and on
+demand with `workflow_dispatch`. It runs on the `libvsr` runner in one
+container with at most four CPUs. First it runs `tools/mutation_check.py`
+on the writable copy of the source: every known defect must make the
+simulator fail. Then four parallel shards run fresh seeds until the time
+budget ends (60 minutes by default): two for three replicas, one for five
+replicas, and one that takes one, two, and seven replicas in turn. A
+shard stops at the first failed seed, and the job fails. The logs
+(`soak.log`, `mutation.log`, and `shard-N.log`) are artifacts for 30 days.
+The `REPLAY` line in the log gives the command for the failed seed. The
+inputs are the first seed, the seed limit for each shard, and the time
+budget.
 
 The manual `CI` workflow can also test AlmaLinux 9. The image helper tags
 prepared images from the Dockerfile and toolchain script content. To
