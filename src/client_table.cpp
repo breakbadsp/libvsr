@@ -26,6 +26,7 @@ void ClientTable::Clear()
   {
     free_slot_indexes_.push_back(slot_index - 1);
   }
+  VSR_ASSERT(free_slot_indexes_.size() == clients_max_);
 }
 
 const ClientEntry *ClientTable::Find(std::uint64_t p_client) const noexcept
@@ -72,6 +73,10 @@ void ClientTable::Commit(const ClientEntry &p_commit, std::span<const std::byte>
     free_slot_indexes_.pop_back();
     position = entries_.insert(position, fresh);
   }
+  VSR_ASSERT(position->client_ == p_commit.client_);
+  // Each reply slot belongs to one entry or is free, never both.
+  VSR_ASSERT(entries_.size() <= clients_max_);
+  VSR_ASSERT(entries_.size() + free_slot_indexes_.size() == clients_max_);
   position->session_ = p_commit.session_;
   position->request_ = p_commit.request_;
   position->op_ = p_commit.op_;

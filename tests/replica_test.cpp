@@ -1,6 +1,10 @@
 #include "test_support.hpp"
+#include "vsr/checksum.hpp"
+#include "vsr/internal/layout.hpp"
+#include "vsr/internal/superblock.hpp"
 #include "vsr/replica.hpp"
 
+#include <cstring>
 #include <gtest/gtest.h>
 #include <memory>
 #include <optional>
@@ -118,6 +122,32 @@ TEST(ReplicaOpen, RefusesWrongStorage)
   const auto bad = Replica::Open(invalid, storage, bus, state_machine);
   ASSERT_FALSE(bad.has_value());
   EXPECT_EQ(bad.error(), OpenError::BadConfig);
+}
+
+// A superblock with a valid checksum and a log view after the view is not
+// a state that the replica writes. Open refuses it and does not assert.
+TEST(ReplicaOpen, RefusesLogViewAfterView)
+{
+  const Config config = SmallConfig();
+  test::MemoryStorage storage{StorageBytes(config)};
+  test::RecordingBus bus;
+  test::KeyValueStateMachine state_machine;
+  ASSERT_TRUE(Format(storage, config).has_value());
+  auto superblock = internal::ReadSuperblock(storage);
+  ASSERT_TRUE(superblock.has_value());
+  superblock->view_ = 1;
+  superblock->log_view_ = 2;
+  superblock->sequence_ += 1;
+  const auto bytes = std::as_bytes(std::span<const internal::Superblock, 1>{&*superblock, 1});
+  superblock->checksum_ = Checksum(bytes.subspan(sizeof(std::uint64_t)));
+  std::array<std::byte, sizeof(internal::Superblock)> copy{};
+  std::memcpy(copy.data(), &*superblock, sizeof(internal::Superblock));
+  const std::uint64_t copy_index = superblock->sequence_ % internal::kSuperblockCopyCount;
+  ASSERT_TRUE(storage.Write(copy_index * internal::kSectorBytes, copy).has_value());
+
+  const auto opened = Replica::Open(config, storage, bus, state_machine);
+  ASSERT_FALSE(opened.has_value());
+  EXPECT_EQ(opened.error(), OpenError::StorageFault);
 }
 
 // A replica that is alone is the primary, and each request gets the reply of

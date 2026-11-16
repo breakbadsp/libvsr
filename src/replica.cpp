@@ -67,6 +67,10 @@ Replica::Replica(const Config &p_config, Storage &p_storage, MessageBus &p_bus,
       body_buffer_(p_config.body_bytes_max_), reply_buffer_(p_config.body_bytes_max_),
       snapshot_buffer_(internal::SnapshotBlobBytesMax(p_config))
 {
+  // Open checks the configuration first. The timers and the checkpoint
+  // modulo divide by values that the check makes nonzero.
+  VSR_ASSERT(ValidateConfig(config_).has_value());
+  VSR_ASSERT(superblock_.log_view_ <= superblock_.view_);
 }
 
 std::expected<Replica, OpenError> Replica::Open(const Config &p_config, Storage &p_storage,
@@ -87,11 +91,19 @@ std::expected<Replica, OpenError> Replica::Open(const Config &p_config, Storage 
   {
     return std::unexpected(OpenError::ConfigMismatch);
   }
+  // No correct write gives a log view after the view, because the replica
+  // sets `log_view_` only to `view_`. The checksum is valid, so the storage
+  // returned bytes that this replica did not write.
+  if (superblock->log_view_ > superblock->view_)
+  {
+    return std::unexpected(OpenError::StorageFault);
+  }
   Replica replica{p_config, p_storage, p_bus, p_state_machine, *superblock};
   if (const auto recovered = replica.Recover(); !recovered)
   {
     return std::unexpected(recovered.error());
   }
+  replica.CheckInvariants();
   return replica;
 }
 
@@ -123,6 +135,8 @@ std::expected<void, OpenError> Replica::Recover()
   {
     return std::unexpected(OpenError::StorageFault);
   }
+  VSR_ASSERT(journal_.Floor() <= superblock_.checkpoint_op_);
+  VSR_ASSERT(journal_.Head() >= superblock_.checkpoint_op_);
   commit_min_ = superblock_.checkpoint_op_;
   commit_max_ = commit_min_;
   op_synced_ = journal_.Head();
@@ -163,6 +177,7 @@ std::expected<void, OpenError> Replica::Recover()
 
 void Replica::Halt(HaltReason p_reason)
 {
+  VSR_ASSERT(p_reason != HaltReason::None);
   if (status_ != Status::Halted)
   {
     status_ = Status::Halted;
@@ -170,8 +185,84 @@ void Replica::Halt(HaltReason p_reason)
   }
 }
 
+void Replica::CheckInvariants() const
+{
+  if (status_ == Status::Halted)
+  {
+    // A halt can stop a change halfway, for example after the superblock
+    // names a new checkpoint and before the log is reset. The other
+    // relations can be false then, and the replica ignores all input.
+    VSR_ASSERT(halt_reason_ != HaltReason::None);
+    return;
+  }
+  VSR_ASSERT(halt_reason_ == HaltReason::None);
+
+  // Views. Each change of `view_` or `log_view_` is durable before the call
+  // returns, or the replica halts.
+  VSR_ASSERT(log_view_ <= view_);
+  VSR_ASSERT(superblock_.view_ == view_);
+  VSR_ASSERT(superblock_.log_view_ == log_view_);
+
+  // Status.
+  if (status_ == Status::Normal)
+  {
+    VSR_ASSERT(log_view_ == view_);
+  }
+  if (status_ == Status::Joining)
+  {
+    // Only a backup joins a view. The primary opens it.
+    VSR_ASSERT(PrimaryOf(view_) != config_.replica_);
+  }
+  if (fetching_)
+  {
+    VSR_ASSERT(status_ == Status::ViewChange);
+    VSR_ASSERT(PrimaryOf(view_) == config_.replica_);
+    VSR_ASSERT(fetch_source_ < config_.replica_count_);
+    VSR_ASSERT(fetch_source_ != config_.replica_);
+  }
+  VSR_ASSERT(!start_view_change_from_.test(config_.replica_));
+
+  // Operation numbers: floor <= checkpoint <= commit_min <= commit_max, and
+  // commit_min <= head. `commit_max_` can be after the head on a backup.
+  VSR_ASSERT(journal_.Floor() <= superblock_.checkpoint_op_);
+  VSR_ASSERT(superblock_.checkpoint_op_ <= commit_min_);
+  VSR_ASSERT(commit_min_ <= commit_max_);
+  VSR_ASSERT(commit_min_ <= journal_.Head());
+  VSR_ASSERT(journal_.Head() <= superblock_.checkpoint_op_ + config_.log_slot_count_);
+  // An acknowledgement never names an entry that is not durable.
+  VSR_ASSERT(prepare_ok_sent_op_ <= op_synced_);
+  VSR_ASSERT(op_synced_ <= journal_.Head());
+
+  // Snapshot transfer. Only a backup in an open view receives a snapshot.
+  VSR_ASSERT(sync_.received_bytes_ <= sync_.total_bytes_);
+  VSR_ASSERT(sync_.total_bytes_ <= snapshot_buffer_.size());
+  if (sync_.active_)
+  {
+    VSR_ASSERT(status_ != Status::ViewChange);
+    VSR_ASSERT(PrimaryOf(view_) != config_.replica_);
+  }
+
+  if (IsPrimary())
+  {
+    VSR_ASSERT(log_verified_);
+    VSR_ASSERT(view_start_known_);
+    VSR_ASSERT(view_start_op_ <= journal_.Head());
+    // The primary counts its own entries only after the sync.
+    VSR_ASSERT(acked_ops_[config_.replica_] <= op_synced_);
+    for (std::uint8_t replica = 0; replica < config_.replica_count_; ++replica)
+    {
+      VSR_ASSERT(acked_ops_[replica] <= journal_.Head());
+    }
+  }
+}
+
 bool Replica::PersistSuperblock()
 {
+  VSR_ASSERT(status_ != Status::Halted);
+  // The durable views never go back.
+  VSR_ASSERT(log_view_ <= view_);
+  VSR_ASSERT(view_ >= superblock_.view_);
+  VSR_ASSERT(log_view_ >= superblock_.log_view_);
   superblock_.view_ = view_;
   superblock_.log_view_ = log_view_;
   if (!internal::WriteSuperblock(*storage_, superblock_))
@@ -184,17 +275,20 @@ bool Replica::PersistSuperblock()
 
 bool Replica::SyncJournal()
 {
+  VSR_ASSERT(status_ != Status::Halted);
   if (!journal_.Sync())
   {
     Halt(HaltReason::StorageFault);
     return false;
   }
   op_synced_ = journal_.Head();
+  VSR_ASSERT(!journal_.Dirty());
   return true;
 }
 
 std::uint64_t Replica::TimeoutWithJitter(std::uint32_t p_ticks)
 {
+  VSR_ASSERT(p_ticks > 0);
   // SplitMix64.
   random_state_ += 0x9E3779B97F4A7C15ULL;
   std::uint64_t mixed = random_state_;
@@ -279,6 +373,10 @@ void Replica::SendPrepareOk()
 {
   VSR_ASSERT(status_ == Status::Normal);
   VSR_ASSERT(PrimaryOf(view_) != config_.replica_);
+  // The acknowledgement promises the log up to `op_synced_` in this view.
+  // Both parts of the promise must be durable.
+  VSR_ASSERT(op_synced_ <= journal_.Head());
+  VSR_ASSERT(superblock_.log_view_ == view_);
   if (op_synced_ < journal_.Floor())
   {
     return;
@@ -312,6 +410,10 @@ void Replica::SendEviction(std::uint64_t p_client)
 
 void Replica::RequestPrepare(std::uint64_t p_op)
 {
+  // Only a replica that copies a log asks for entries, and the log has no gap.
+  VSR_ASSERT(status_ == Status::Normal || status_ == Status::Joining || Fetching());
+  VSR_ASSERT(!IsPrimary());
+  VSR_ASSERT(p_op == journal_.Head() + 1);
   // One request returns a batch. Do not ask again while the batch can still
   // arrive, or each entry of the batch causes a new batch.
   const bool outstanding = request_prepare_op_ != 0 && p_op >= request_prepare_op_ &&
@@ -376,6 +478,7 @@ void Replica::OnMessage(std::span<const std::byte> p_message)
   if (header.command_ == Command::Request)
   {
     OnRequest(*message);
+    CheckInvariants();
     return;
   }
   if (header.replica_ >= config_.replica_count_ || header.replica_ == config_.replica_)
@@ -387,29 +490,29 @@ void Replica::OnMessage(std::span<const std::byte> p_message)
   {
   case Command::Prepare:
     OnPrepare(*message);
-    return;
+    break;
   case Command::PrepareOk:
     OnPrepareOk(header);
-    return;
+    break;
   case Command::Commit:
   case Command::StartView:
     OnCommit(header);
-    return;
+    break;
   case Command::StartViewChange:
     OnStartViewChange(header);
-    return;
+    break;
   case Command::DoViewChange:
     OnDoViewChange(header);
-    return;
+    break;
   case Command::RequestPrepare:
     OnRequestPrepare(header);
-    return;
+    break;
   case Command::RequestSnapshot:
     OnRequestSnapshot(header);
-    return;
+    break;
   case Command::Snapshot:
     OnSnapshot(*message);
-    return;
+    break;
   case Command::Reserved:
   case Command::Request:
   case Command::Reply:
@@ -417,6 +520,7 @@ void Replica::OnMessage(std::span<const std::byte> p_message)
     stats_.messages_invalid_ += 1;
     return;
   }
+  CheckInvariants();
 }
 
 SubmitResult Replica::Submit(std::uint64_t p_client, std::uint64_t p_request,
@@ -426,7 +530,9 @@ SubmitResult Replica::Submit(std::uint64_t p_client, std::uint64_t p_request,
   {
     return SubmitResult::Invalid;
   }
-  return HandleRequest(p_client, p_request, p_session, p_body);
+  const SubmitResult result = HandleRequest(p_client, p_request, p_session, p_body);
+  CheckInvariants();
+  return result;
 }
 
 void Replica::OnRequest(const Message &p_message)
@@ -535,6 +641,8 @@ SubmitResult Replica::HandleRequest(std::uint64_t p_client, std::uint64_t p_requ
   {
     return SubmitResult::Invalid;
   }
+  VSR_ASSERT(journal_.Head() == op);
+  VSR_ASSERT(journal_.Head() - commit_max_ <= config_.pipeline_max_);
   Header header = MakeHeader(Command::Prepare);
   header.commit_ = commit_max_;
   header.checkpoint_op_ = superblock_.checkpoint_op_;
@@ -566,6 +674,8 @@ bool Replica::FollowPrimary(const Header &p_header)
   {
     return false;
   }
+  VSR_ASSERT(view_ == p_header.view_);
+  VSR_ASSERT(PrimaryOf(view_) != config_.replica_);
   view_start_known_ = true;
   view_start_op_ = p_header.view_start_op_;
   primary_deadline_tick_ = TimeoutWithJitter(config_.primary_timeout_ticks_);
@@ -643,6 +753,8 @@ void Replica::LearnCommit(const Header &p_header)
 
 void Replica::HandleEntryNormal(const Entry &p_entry)
 {
+  VSR_ASSERT(status_ == Status::Normal);
+  VSR_ASSERT(PrimaryOf(view_) != config_.replica_);
   const EntryHeader &entry = p_entry.header_;
   if (entry.op_ <= journal_.Head())
   {
@@ -684,6 +796,7 @@ void Replica::HandleEntryNormal(const Entry &p_entry)
 // followed log, so they are not committed, and this replica removes them.
 void Replica::HandleEntryUnverified(const Entry &p_entry)
 {
+  VSR_ASSERT(status_ == Status::Joining || Fetching());
   const EntryHeader &entry = p_entry.header_;
   if (entry.op_ <= journal_.Head())
   {
@@ -761,6 +874,7 @@ void Replica::HandleEntryUnverified(const Entry &p_entry)
 
 bool Replica::AppendEntry(const Entry &p_entry)
 {
+  VSR_ASSERT(status_ != Status::Halted);
   // An entry past this point would replace an entry that no checkpoint
   // covers. The replica must execute and checkpoint first.
   if (p_entry.header_.op_ > superblock_.checkpoint_op_ + config_.log_slot_count_)
@@ -772,12 +886,14 @@ bool Replica::AppendEntry(const Entry &p_entry)
     Halt(HaltReason::StorageFault);
     return false;
   }
+  VSR_ASSERT(journal_.Head() == p_entry.header_.op_);
   timestamp_last_ns_ = std::max(timestamp_last_ns_, p_entry.header_.timestamp_ns_);
   return true;
 }
 
 bool Replica::TruncateTo(std::uint64_t p_op)
 {
+  VSR_ASSERT(status_ != Status::Halted);
   VSR_ASSERT(p_op >= journal_.Floor());
   VSR_ASSERT(p_op <= journal_.Head());
   if (p_op == journal_.Head())
@@ -791,6 +907,9 @@ bool Replica::TruncateTo(std::uint64_t p_op)
     stats_.protocol_violations_ += 1;
     return false;
   }
+  // The check above keeps every executed operation: commit_min_ is at most
+  // both commit_max_ and the head.
+  VSR_ASSERT(p_op >= commit_min_);
   if (!journal_.TruncateTo(p_op))
   {
     Halt(HaltReason::StorageFault);
@@ -798,6 +917,7 @@ bool Replica::TruncateTo(std::uint64_t p_op)
   }
   op_synced_ = std::min(op_synced_, p_op);
   prepare_ok_sent_op_ = std::min(prepare_ok_sent_op_, p_op);
+  VSR_ASSERT(journal_.Head() == p_op);
   return true;
 }
 
@@ -848,6 +968,7 @@ void Replica::Follow()
 
 void Replica::OnVerified()
 {
+  VSR_ASSERT(status_ == Status::Joining || Fetching());
   log_verified_ = true;
   if (Fetching())
   {
@@ -892,6 +1013,9 @@ void Replica::BecomeNormal()
 {
   VSR_ASSERT(status_ == Status::Joining);
   VSR_ASSERT(log_verified_);
+  VSR_ASSERT(view_start_known_);
+  VSR_ASSERT(journal_.Head() >= view_start_op_);
+  VSR_ASSERT(PrimaryOf(view_) != config_.replica_);
   if (!SyncJournal())
   {
     return;
@@ -1046,6 +1170,10 @@ void Replica::MaybeSendDoViewChange()
 void Replica::SendDoViewChange()
 {
   VSR_ASSERT(do_view_change_sent_);
+  VSR_ASSERT(status_ == Status::ViewChange);
+  // The message promises the view and the log head. Both must be durable.
+  VSR_ASSERT(superblock_.view_ == view_);
+  VSR_ASSERT(op_synced_ == journal_.Head());
   if (PrimaryOf(view_) == config_.replica_)
   {
     auto &own = do_view_changes_[config_.replica_];
@@ -1153,6 +1281,8 @@ void Replica::CheckViewChangeQuorum()
   {
     return;
   }
+  VSR_ASSERT(best < config_.replica_count_);
+  VSR_ASSERT(do_view_changes_[best].present_);
   view_commit_ = commit;
   target_known_ = true;
   target_op_ = do_view_changes_[best].op_;
@@ -1171,6 +1301,11 @@ void Replica::FinishViewChange()
 {
   VSR_ASSERT(status_ == Status::ViewChange);
   VSR_ASSERT(PrimaryOf(view_) == config_.replica_);
+  // The log is the selected log. In a view change the log of the new
+  // primary changes only while it copies the selected log.
+  VSR_ASSERT(target_known_);
+  VSR_ASSERT(journal_.Head() == target_op_);
+  VSR_ASSERT(journal_.HeadChecksum() == target_checksum_);
   if (!SyncJournal())
   {
     return;
@@ -1216,6 +1351,7 @@ void Replica::AdvanceCommit()
       quorum_op = std::max(quorum_op, acked_ops_[candidate]);
     }
   }
+  VSR_ASSERT(quorum_op <= journal_.Head());
   if (quorum_op > commit_max_)
   {
     commit_max_ = quorum_op;
@@ -1239,6 +1375,11 @@ void Replica::ExecuteCommitted()
 
 void Replica::ExecuteOne(std::uint64_t p_op)
 {
+  VSR_ASSERT(status_ != Status::Halted);
+  // Execution is in order, with no gap, and only of committed entries.
+  VSR_ASSERT(p_op == commit_min_ + 1);
+  VSR_ASSERT(p_op <= commit_max_);
+  VSR_ASSERT(p_op <= journal_.Head());
   const EntryHeader entry = journal_.HeaderAt(p_op);
   const auto body = journal_.ReadBody(p_op, body_buffer_);
   if (!body)
@@ -1278,6 +1419,14 @@ void Replica::ExecuteOne(std::uint64_t p_op)
     clients_.Commit(commit, std::span{reply_buffer_}.first(reply_bytes));
     committed = true;
   }
+  if (committed)
+  {
+    // Read back what the table recorded for this operation.
+    const auto *const recorded = clients_.Find(entry.client_);
+    VSR_ASSERT(recorded != nullptr);
+    VSR_ASSERT(recorded->op_ == p_op);
+    VSR_ASSERT(recorded->request_ == entry.request_);
+  }
   if (committed && IsPrimary())
   {
     SendReply(*clients_.Find(entry.client_));
@@ -1294,6 +1443,9 @@ void Replica::ExecuteOne(std::uint64_t p_op)
 // the checkpoints are then equal, unless the state machines differ.
 void Replica::Checkpoint()
 {
+  VSR_ASSERT(status_ != Status::Halted);
+  VSR_ASSERT(commit_min_ % config_.checkpoint_interval_ == 0);
+  VSR_ASSERT(commit_min_ > superblock_.checkpoint_op_);
   // The buffer is shared with a snapshot that is in transfer. The transfer
   // starts again.
   sync_ = SnapshotSync{};
@@ -1331,6 +1483,7 @@ void Replica::Checkpoint()
   {
     return;
   }
+  VSR_ASSERT(superblock_.checkpoint_op_ == commit_min_);
   stats_.checkpoints_ += 1;
 }
 
@@ -1434,7 +1587,9 @@ void Replica::OnSnapshot(const Message &p_message)
 
 void Replica::InstallSnapshot()
 {
+  VSR_ASSERT(status_ != Status::Halted);
   VSR_ASSERT(sync_.active_);
+  VSR_ASSERT(sync_.received_bytes_ == sync_.total_bytes_);
   VSR_ASSERT(sync_.checkpoint_op_ > journal_.Head());
   const auto blob = std::span<const std::byte>{snapshot_buffer_}.first(sync_.total_bytes_);
   const auto slot_index =
@@ -1468,6 +1623,9 @@ void Replica::InstallSnapshot()
   commit_min_ = sync_.checkpoint_op_;
   commit_max_ = std::max(commit_max_, commit_min_);
   op_synced_ = commit_min_;
+  VSR_ASSERT(journal_.Floor() == commit_min_);
+  VSR_ASSERT(journal_.Head() == commit_min_);
+  VSR_ASSERT(superblock_.checkpoint_op_ == commit_min_);
   prepare_ok_sent_op_ = 0;
   request_prepare_op_ = 0;
   sync_ = SnapshotSync{};
@@ -1517,10 +1675,12 @@ void Replica::Tick(std::uint64_t p_realtime_ns)
     break;
   }
   ExecuteCommitted();
+  CheckInvariants();
 }
 
 void Replica::TickPrimary(bool p_retry_due)
 {
+  VSR_ASSERT(IsPrimary());
   if (ticks_ >= heartbeat_deadline_tick_)
   {
     heartbeat_deadline_tick_ = ticks_ + config_.heartbeat_ticks_;
@@ -1552,6 +1712,8 @@ void Replica::TickPrimary(bool p_retry_due)
 
 void Replica::TickBackup(bool p_retry_due)
 {
+  VSR_ASSERT(status_ == Status::Normal || status_ == Status::Joining);
+  VSR_ASSERT(!IsPrimary());
   if (ticks_ >= primary_deadline_tick_)
   {
     StartViewChange(view_ + 1);
@@ -1584,6 +1746,7 @@ void Replica::TickBackup(bool p_retry_due)
 
 void Replica::TickViewChange(bool p_retry_due)
 {
+  VSR_ASSERT(status_ == Status::ViewChange);
   if (ticks_ >= view_change_deadline_tick_)
   {
     StartViewChange(view_ + 1);
@@ -1627,6 +1790,7 @@ void Replica::Flush()
     }
   }
   ExecuteCommitted();
+  CheckInvariants();
 }
 
 } // namespace vsr

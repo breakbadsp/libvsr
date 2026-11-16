@@ -181,6 +181,9 @@ private:
   }
 
   [[nodiscard]] std::expected<void, OpenError> Recover();
+  // Asserts the relations between the fields that every public call keeps.
+  // It reads no storage and does no work that grows with the log.
+  void CheckInvariants() const;
   void Halt(HaltReason p_reason);
   [[nodiscard]] bool PersistSuperblock();
   [[nodiscard]] bool SyncJournal();

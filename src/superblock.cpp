@@ -1,5 +1,6 @@
 #include "vsr/internal/superblock.hpp"
 
+#include "vsr/assert.hpp"
 #include "vsr/checksum.hpp"
 #include "vsr/internal/layout.hpp"
 #include "vsr/message.hpp"
@@ -82,6 +83,9 @@ std::expected<Superblock, SuperblockError> ReadSuperblock(Storage &p_storage)
 
 std::expected<void, StorageError> WriteSuperblock(Storage &p_storage, Superblock &p_superblock)
 {
+  // Replica::Open refuses a superblock that breaks these rules. Never write one.
+  VSR_ASSERT(p_superblock.version_ == kStorageVersion);
+  VSR_ASSERT(p_superblock.log_view_ <= p_superblock.view_);
   p_superblock.sequence_ += 1;
   p_superblock.checksum_ = SuperblockChecksum(p_superblock);
   // A full sector, so that the device writes the copy in one unit.
