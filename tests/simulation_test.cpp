@@ -1,6 +1,11 @@
-#include "simulation.hpp"
+#include "vsr/checksum.hpp"
+#include "vsr/sim/simulation.hpp"
 
+#include <array>
+#include <cstring>
 #include <gtest/gtest.h>
+#include <memory>
+#include <span>
 
 // Each test runs the production replica code in the simulator for a range of
 // seeds. A run fails if two replicas disagree, if a client sees a wrong or
@@ -45,7 +50,178 @@ struct Totals
   return totals;
 }
 
+// What a `SumApplication` does wrong. Each defect breaks one rule of the
+// host contract.
+struct Defects
+{
+  // Added to the state at each operation. Not zero: replicas disagree.
+  std::uint64_t state_salt_ = 0;
+  // Added to each reply. Not zero: replicas give different replies.
+  std::uint64_t reply_salt_ = 0;
+  // The snapshot does not hold the operation count.
+  bool snapshot_loses_count_ = false;
+};
+
+// A second state machine, to show that the simulator runs and checks the
+// application of a host. The state is the sum of all operands and the
+// number of operations. A valid body is one 64-bit operand.
+class SumApplication final : public Application
+{
+public:
+  SumApplication(Defects p_defects, std::size_t p_snapshot_bytes)
+      : defects_(p_defects), snapshot_bytes_(p_snapshot_bytes)
+  {
+  }
+
+  [[nodiscard]] std::size_t Execute(const Operation &, std::span<const std::byte> p_body,
+                                    std::span<std::byte> p_reply) override
+  {
+    std::uint64_t operand = 0;
+    if (p_body.size() != sizeof(operand))
+    {
+      return 0;
+    }
+    std::memcpy(&operand, p_body.data(), sizeof(operand));
+    state_[0] += operand + defects_.state_salt_;
+    state_[1] += 1;
+    const std::uint64_t reply = state_[0] + defects_.reply_salt_;
+    std::memcpy(p_reply.data(), &reply, sizeof(reply));
+    return sizeof(reply);
+  }
+
+  [[nodiscard]] std::expected<std::size_t, std::monostate>
+  Snapshot(std::span<std::byte> p_out) override
+  {
+    if (p_out.size() < snapshot_bytes_)
+    {
+      return std::unexpected(std::monostate{});
+    }
+    std::ranges::fill(p_out.first(snapshot_bytes_), std::byte{0});
+    const std::array<std::uint64_t, 2> stored{state_[0],
+                                              defects_.snapshot_loses_count_ ? 0 : state_[1]};
+    std::memcpy(p_out.data(), stored.data(), sizeof(stored));
+    return snapshot_bytes_;
+  }
+
+  [[nodiscard]] bool Restore(std::span<const std::byte> p_snapshot) override
+  {
+    if (p_snapshot.size() != snapshot_bytes_)
+    {
+      return false;
+    }
+    std::memcpy(state_.data(), p_snapshot.data(), sizeof(state_));
+    return true;
+  }
+
+  [[nodiscard]] std::uint64_t Digest() const override
+  {
+    return Checksum(std::as_bytes(std::span{state_}));
+  }
+
+private:
+  Defects defects_;
+  std::size_t snapshot_bytes_;
+  // The sum, then the operation count.
+  std::array<std::uint64_t, 2> state_{};
+};
+
+constexpr std::size_t kSumSnapshotBytes = 2 * sizeof(std::uint64_t);
+
+// Options that run `SumApplication` with valid bodies.
+[[nodiscard]] Options SumOptions(std::size_t p_snapshot_bytes = kSumSnapshotBytes)
+{
+  Options options;
+  options.application_factory_ = [p_snapshot_bytes]
+  { return std::make_unique<SumApplication>(Defects{}, p_snapshot_bytes); };
+  options.body_generator_ = [](std::uint64_t p_random)
+  {
+    std::vector<std::byte> body(sizeof(p_random));
+    std::memcpy(body.data(), &p_random, sizeof(p_random));
+    return body;
+  };
+  return options;
+}
+
+// Options that give each `SumApplication` object a different salt. A salt
+// is a multiple of `p_step`, so `Defects{}` as the step gives no defect.
+[[nodiscard]] Options DefectOptions(Defects p_step)
+{
+  Options options = SumOptions();
+  options.application_factory_ = [p_step, made = std::make_shared<std::uint64_t>(0)]
+  {
+    *made += 1;
+    Defects defects = p_step;
+    defects.state_salt_ *= *made;
+    defects.reply_salt_ *= *made;
+    return std::make_unique<SumApplication>(defects, kSumSnapshotBytes);
+  };
+  return options;
+}
+
 } // namespace
+
+// The simulator runs the application of a host through the same faults and
+// checks as its own state machine.
+TEST(Simulation, HostApplicationWithFaults)
+{
+  const Totals totals = RunSeeds(SumOptions(), 40);
+  EXPECT_GT(totals.committed_ops_, 0U);
+  EXPECT_GT(totals.crashes_, 0U);
+  EXPECT_GT(totals.checkpoints_, 0U);
+  EXPECT_GT(totals.snapshots_installed_, 0U);
+}
+
+// The same options pass without a defect, so each failure below comes from
+// the defect and not from the options.
+TEST(Simulation, HostApplicationWithoutDefectPasses)
+{
+  const Result result = sim::Run(DefectOptions(Defects{}));
+  EXPECT_TRUE(result.ok_) << result.failure_;
+}
+
+// Replicas that reach different states from the same operations fail the
+// run, also when their replies are equal.
+TEST(Simulation, HostApplicationWithDifferentStateFails)
+{
+  const Result result = sim::Run(DefectOptions(Defects{.state_salt_ = 1, .reply_salt_ = ~0ULL}));
+  EXPECT_FALSE(result.ok_);
+  EXPECT_NE(result.failure_.find("different state"), std::string::npos) << result.failure_;
+}
+
+// Replicas with equal states that give different replies fail the run.
+TEST(Simulation, HostApplicationWithDifferentReplyFails)
+{
+  const Result result = sim::Run(DefectOptions(Defects{.reply_salt_ = 1}));
+  EXPECT_FALSE(result.ok_);
+  EXPECT_NE(result.failure_.find("different reply"), std::string::npos) << result.failure_;
+}
+
+// A snapshot that does not hold the full state fails the run.
+TEST(Simulation, HostApplicationWithIncompleteSnapshotFails)
+{
+  const Result result = sim::Run(DefectOptions(Defects{.snapshot_loses_count_ = true}));
+  EXPECT_FALSE(result.ok_);
+  EXPECT_NE(result.failure_.find("snapshot"), std::string::npos) << result.failure_;
+}
+
+// The limits come from the options: a snapshot and a body above the default
+// limits need larger limits.
+TEST(Simulation, HostApplicationLimits)
+{
+  constexpr std::size_t kLargeSnapshotBytes = 5000;
+  constexpr std::size_t kLargeBodyBytes = 400;
+  Options options = SumOptions(kLargeSnapshotBytes);
+  EXPECT_FALSE(sim::Run(options).ok_);
+  options.limits_.snapshot_bytes_max_ = kLargeSnapshotBytes;
+  const Result result = sim::Run(options);
+  EXPECT_TRUE(result.ok_) << result.failure_;
+  EXPECT_GT(result.checkpoints_, 0U);
+
+  options.body_generator_ = [](std::uint64_t) { return std::vector<std::byte>(kLargeBodyBytes); };
+  EXPECT_FALSE(sim::Run(options).ok_);
+  options.limits_.body_bytes_max_ = kLargeBodyBytes;
+  EXPECT_TRUE(sim::Run(options).ok_);
+}
 
 // Without faults, each request commits, and no view change is necessary
 // after the first primary is elected.
