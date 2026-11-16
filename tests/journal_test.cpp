@@ -141,6 +141,46 @@ TEST(Journal, RecoveryErasesEntryAfterLostEntry)
   EXPECT_EQ(again.Head(), 2U);
 }
 
+// This checks recovery when the head is the checkpoint and an old entry one
+// full lap after it sits in the slot of the checkpoint. A power loss lost the
+// entries between them. The journal gets those entries again, and the old
+// entry must not be a part of the log when the storage opens again.
+TEST(Journal, RecoveryErasesEntryOneLapAfterCheckpoint)
+{
+  Config config;
+  config.log_slot_count_ = 8;
+  const auto layout = MakeLayout(config);
+  test::MemoryStorage storage{layout.total_bytes_};
+  Journal journal{&storage, layout};
+  const auto root = RootChecksum(config.cluster_);
+  ASSERT_TRUE(journal.Recover(0, root));
+  constexpr std::uint64_t checkpoint = 4;
+  constexpr std::uint64_t stale = checkpoint + 8;
+  std::array<std::uint64_t, stale + 1> checksums{};
+  for (std::uint64_t op = 1; op <= stale; ++op)
+  {
+    Append(journal, "body");
+    checksums[op] = journal.HeadChecksum();
+  }
+  ASSERT_TRUE(journal.Sync());
+  for (std::uint64_t op = checkpoint + 1; op < stale; ++op)
+  {
+    std::fill_n(storage.bytes_.begin() + static_cast<std::ptrdiff_t>(layout.SlotOffset(op)),
+                kEntryHeaderBytes, std::byte{0});
+  }
+  Journal recovered{&storage, layout};
+  ASSERT_TRUE(recovered.Recover(checkpoint, checksums[checkpoint]));
+  ASSERT_EQ(recovered.Head(), checkpoint);
+  for (std::uint64_t op = checkpoint + 1; op < stale; ++op)
+  {
+    Append(recovered, "body");
+  }
+  ASSERT_TRUE(recovered.Sync());
+  Journal again{&storage, layout};
+  ASSERT_TRUE(again.Recover(checkpoint, checksums[checkpoint]));
+  EXPECT_EQ(again.Head(), stale - 1);
+}
+
 // This checks ring recovery on both sides of a checkpoint after multiple laps.
 TEST(Journal, WrapRecoversAroundCheckpoint)
 {

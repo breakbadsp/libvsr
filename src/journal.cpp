@@ -64,7 +64,11 @@ std::expected<void, StorageError> Journal::Recover(std::uint64_t p_checkpoint_op
   // an unsynced entry and lose the entry before it. Erase each such entry.
   // If it stays, it links to the head again when this replica gets the lost
   // entry a second time, and the next recovery reads it as a part of the log.
-  for (std::uint64_t op = head_op_ + 1; op < head_op_ + layout_.slot_count_; ++op)
+  // The check includes the op one full lap after the head. It uses the slot
+  // of the head: when the head is the checkpoint, that slot can hold the
+  // stale entry. When the head is after the checkpoint, the slot holds the
+  // head, and the op check in ReadSlot keeps it.
+  for (std::uint64_t op = head_op_ + 1; op <= head_op_ + layout_.slot_count_; ++op)
   {
     EntryHeader header;
     const auto found = ReadSlot(op, header);
