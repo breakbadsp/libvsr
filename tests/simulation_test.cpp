@@ -287,6 +287,19 @@ TEST(Simulation, TraceIsDeterministic)
   EXPECT_GT(count(" state "), 0U);
 }
 
+// A known defect in the journal, see "Known defect" in docs/verification.md.
+// A power loss loses one unsynced entry and keeps the entry after it. When
+// the replica gets the lost entry again, the old entry after it becomes a
+// part of the log at the next restart. Enable this test with the correction.
+// If the simulator changes, the seed can stop to show the defect.
+TEST(Simulation, DISABLED_StaleEntryAfterLostWrite)
+{
+  Options options;
+  options.seed_ = 1780;
+  const Result result = sim::Run(options);
+  EXPECT_TRUE(result.ok_) << result.failure_;
+}
+
 // Without faults, each request commits, and no view change is necessary
 // after the first primary is elected.
 TEST(Simulation, NoFaultsThreeReplicas)
